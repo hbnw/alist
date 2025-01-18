@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path"
+	"sync"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -17,6 +20,8 @@ type Onedrive struct {
 	model.Storage
 	Addition
 	AccessToken string
+	root        *Object
+	mutex       sync.Mutex
 }
 
 func (d *Onedrive) Config() driver.Config {
@@ -38,6 +43,42 @@ func (d *Onedrive) Drop(ctx context.Context) error {
 	return nil
 }
 
+func (d *Onedrive) GetRoot(ctx context.Context) (model.Obj, error) {
+	if d.root != nil {
+		return d.root, nil
+	}
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	root := &Object{
+		ObjThumb: model.ObjThumb{
+			Object: model.Object{
+				ID:       "root",
+				Path:     d.RootFolderPath,
+				Name:     "root",
+				Size:     0,
+				Modified: d.Modified,
+				Ctime:    d.Modified,
+				IsFolder: true,
+			},
+		},
+		ParentID: "",
+	}
+	if !utils.PathEqual(d.RootFolderPath, "/") {
+		// get root folder id
+		url := d.GetMetaUrl(false, d.RootFolderPath)
+		var resp struct {
+			Id string `json:"id"`
+		}
+		_, err := d.Request(url, http.MethodGet, nil, &resp)
+		if err != nil {
+			return nil, err
+		}
+		root.ID = resp.Id
+	}
+	d.root = root
+	return d.root, nil
+}
+
 func (d *Onedrive) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	files, err := d.getFiles(dir.GetPath())
 	if err != nil {
@@ -56,8 +97,17 @@ func (d *Onedrive) Link(ctx context.Context, file model.Obj, args model.LinkArgs
 	if f.File == nil {
 		return nil, errs.NotFile
 	}
+	u := f.Url
+	if d.CustomHost != "" {
+		_u, err := url.Parse(f.Url)
+		if err != nil {
+			return nil, err
+		}
+		_u.Host = d.CustomHost
+		u = _u.String()
+	}
 	return &model.Link{
-		URL: f.Url,
+		URL: u,
 	}, nil
 }
 
@@ -68,6 +118,7 @@ func (d *Onedrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName str
 		"folder":                            base.Json{},
 		"@microsoft.graph.conflictBehavior": "rename",
 	}
+	// todo 修复文件夹 ctime/mtime, onedrive 可在 data 里设置 fileSystemInfo 字段, 但是此接口未提供 ctime/mtime
 	_, err := d.Request(url, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
@@ -75,9 +126,19 @@ func (d *Onedrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName str
 }
 
 func (d *Onedrive) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
+	parentPath := ""
+	if dstDir.GetID() == "" {
+		parentPath = dstDir.GetPath()
+		if utils.PathEqual(parentPath, "/") {
+			parentPath = path.Join("/drive/root", parentPath)
+		} else {
+			parentPath = path.Join("/drive/root:/", parentPath)
+		}
+	}
 	data := base.Json{
 		"parentReference": base.Json{
-			"id": dstDir.GetID(),
+			"id":   dstDir.GetID(),
+			"path": parentPath,
 		},
 		"name": srcObj.GetName(),
 	}
@@ -89,12 +150,14 @@ func (d *Onedrive) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 }
 
 func (d *Onedrive) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
-	//dstDir, err := op.GetUnwrap(ctx, d, stdpath.Dir(srcObj.GetPath()))
 	var parentID string
 	if o, ok := srcObj.(*Object); ok {
 		parentID = o.ParentID
 	} else {
 		return fmt.Errorf("srcObj is not Object")
+	}
+	if parentID == "" {
+		parentID = "root"
 	}
 	data := base.Json{
 		"parentReference": base.Json{

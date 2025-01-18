@@ -1,11 +1,11 @@
 package op
 
 import (
+	"github.com/alist-org/alist/v3/internal/errs"
 	"strings"
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/pkg/utils"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -15,7 +15,11 @@ func GetStorageAndActualPath(rawPath string) (storage driver.Driver, actualPath 
 	rawPath = utils.FixAndCleanPath(rawPath)
 	storage = GetBalancedStorage(rawPath)
 	if storage == nil {
-		err = errors.Errorf("can't find storage with rawPath: %s", rawPath)
+		if rawPath == "/" {
+			err = errs.NewErr(errs.StorageNotFound, "please add a storage first")
+			return
+		}
+		err = errs.NewErr(errs.StorageNotFound, "rawPath: %s", rawPath)
 		return
 	}
 	log.Debugln("use storage: ", storage.GetStorage().MountPath)

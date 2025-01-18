@@ -3,12 +3,12 @@ package static
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
-	"net/http/pprof"
+	"os"
 	"strings"
 
-	"github.com/alist-org/alist/v3/cmd/flags"
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/setting"
 	"github.com/alist-org/alist/v3/pkg/utils"
@@ -16,20 +16,40 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func InitIndex() {
-	index, err := public.Public.ReadFile("dist/index.html")
+var static fs.FS
+
+func initStatic() {
+	if conf.Conf.DistDir == "" {
+		dist, err := fs.Sub(public.Public, "dist")
+		if err != nil {
+			utils.Log.Fatalf("failed to read dist dir")
+		}
+		static = dist
+		return
+	}
+	static = os.DirFS(conf.Conf.DistDir)
+}
+
+func initIndex() {
+	indexFile, err := static.Open("index.html")
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			utils.Log.Fatalf("index.html not exist, you may forget to put dist of frontend to public/dist")
 		}
 		utils.Log.Fatalf("failed to read index.html: %v", err)
 	}
+	defer func() {
+		_ = indexFile.Close()
+	}()
+	index, err := io.ReadAll(indexFile)
+	if err != nil {
+		utils.Log.Fatalf("failed to read dist/index.html")
+	}
 	conf.RawIndexHtml = string(index)
 	siteConfig := getSiteConfig()
 	replaceMap := map[string]string{
 		"cdn: undefined":       fmt.Sprintf("cdn: '%s'", siteConfig.Cdn),
 		"base_path: undefined": fmt.Sprintf("base_path: '%s'", siteConfig.BasePath),
-		"api: undefined":       fmt.Sprintf("api: '%s'", siteConfig.ApiURL),
 	}
 	for k, v := range replaceMap {
 		conf.RawIndexHtml = strings.Replace(conf.RawIndexHtml, k, v, 1)
@@ -62,8 +82,9 @@ func UpdateIndex() {
 	}
 }
 
-func Static(r *gin.Engine) {
-	InitIndex()
+func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
+	initStatic()
+	initIndex()
 	folders := []string{"assets", "images", "streamer", "static"}
 	r.Use(func(c *gin.Context) {
 		for i := range folders {
@@ -73,21 +94,22 @@ func Static(r *gin.Engine) {
 		}
 	})
 	for i, folder := range folders {
-		folder = "dist/" + folder
-		sub, err := fs.Sub(public.Public, folder)
+		sub, err := fs.Sub(static, folder)
 		if err != nil {
 			utils.Log.Fatalf("can't find folder: %s", folder)
 		}
 		r.StaticFS(fmt.Sprintf("/%s/", folders[i]), http.FS(sub))
 	}
 
-	r.NoRoute(func(c *gin.Context) {
+	noRoute(func(c *gin.Context) {
+		if c.Request.Method != "GET" && c.Request.Method != "POST" {
+			c.Status(405)
+			return
+		}
 		c.Header("Content-Type", "text/html")
 		c.Status(200)
 		if strings.HasPrefix(c.Request.URL.Path, "/@manage") {
 			_, _ = c.Writer.WriteString(conf.ManageHtml)
-		} else if strings.HasPrefix(c.Request.URL.Path, "/debug/pprof") && flags.Debug {
-			pprof.Index(c.Writer, c.Request)
 		} else {
 			_, _ = c.Writer.WriteString(conf.IndexHtml)
 		}

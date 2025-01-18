@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"github.com/alist-org/alist/v3/pkg/utils"
 	"io"
 	"net/http"
 	"net/url"
@@ -81,6 +82,11 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 // SetTransport exposes the ability to define custom transports
 func (c *Client) SetTransport(transport http.RoundTripper) {
 	c.c.Transport = transport
+}
+
+// SetJar exposes the ability to set a cookie jar to the client.
+func (c *Client) SetJar(jar http.CookieJar) {
+	c.c.Jar = jar
 }
 
 // Connect connects to our dav server
@@ -343,14 +349,19 @@ func (c *Client) Read(path string) ([]byte, error) {
 }
 
 func (c *Client) Link(path string) (string, http.Header, error) {
-	method := "HEAD"
-	url := PathEscape(Join(c.root, path))
-	r, err := http.NewRequest(method, url, nil)
+	method := "GET"
+	u := PathEscape(Join(c.root, path))
+	r, err := http.NewRequest(method, u, nil)
 
 	if err != nil {
 		return "", nil, newPathErrorErr("Link", path, err)
 	}
 
+	if c.c.Jar != nil {
+		for _, cookie := range c.c.Jar.Cookies(r.URL) {
+			r.AddCookie(cookie)
+		}
+	}
 	for k, vals := range c.headers {
 		for _, v := range vals {
 			r.Header.Add(k, v)
@@ -366,31 +377,6 @@ func (c *Client) Link(path string) (string, http.Header, error) {
 	if c.interceptor != nil {
 		c.interceptor(method, r)
 	}
-
-	rs, err := c.c.Do(r)
-	if err != nil {
-		return "", nil, newPathErrorErr("Link", path, err)
-	}
-
-	if rs.StatusCode == 401 {
-		wwwAuthenticateHeader := strings.ToLower(rs.Header.Get("Www-Authenticate"))
-		if strings.Contains(wwwAuthenticateHeader, "digest") {
-			c.authMutex.Lock()
-			c.auth = &DigestAuth{auth.User(), auth.Pass(), digestParts(rs)}
-			c.auth.Authorize(r, method, path)
-			c.authMutex.Unlock()
-		} else if strings.Contains(wwwAuthenticateHeader, "basic") {
-			c.authMutex.Lock()
-			c.auth = &BasicAuth{auth.User(), auth.Pass()}
-			c.auth.Authorize(r, method, path)
-			c.authMutex.Unlock()
-		} else {
-			return "", nil, newPathError("Authorize", c.root, rs.StatusCode)
-		}
-	} else if rs.StatusCode > 400 {
-		return "", nil, newPathError("Authorize", path, rs.StatusCode)
-	}
-
 	return r.URL.String(), r.Header, nil
 }
 
@@ -434,7 +420,7 @@ func (c *Client) ReadStreamRange(path string, offset, length int64) (io.ReadClos
 	// stream in rs.Body
 	if rs.StatusCode == 200 {
 		// discard first 'offset' bytes.
-		if _, err := io.Copy(io.Discard, io.LimitReader(rs.Body, offset)); err != nil {
+		if _, err := utils.CopyWithBuffer(io.Discard, io.LimitReader(rs.Body, offset)); err != nil {
 			return nil, newPathErrorErr("ReadStreamRange", path, err)
 		}
 

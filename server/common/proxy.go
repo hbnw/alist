@@ -1,106 +1,104 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
-	"os"
-	"strconv"
-	"strings"
 
-	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/net"
+	"github.com/alist-org/alist/v3/internal/stream"
+	"github.com/alist-org/alist/v3/pkg/http_range"
 	"github.com/alist-org/alist/v3/pkg/utils"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
-var HttpClient = &http.Client{}
-
 func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.Obj) error {
-	// read data with native
-	var err error
-	if link.Data != nil {
-		defer func() {
-			_ = link.Data.Close()
-		}()
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, file.GetName(), url.QueryEscape(file.GetName())))
-		w.Header().Set("Content-Length", strconv.FormatInt(file.GetSize(), 10))
-		if link.Header != nil {
-			// TODO clean header with blacklist or whitelist
-			link.Header.Del("set-cookie")
-			for h, val := range link.Header {
-				w.Header()[h] = val
-			}
+	if link.MFile != nil {
+		defer link.MFile.Close()
+		attachFileName(w, file)
+		contentType := link.Header.Get("Content-Type")
+		if contentType != "" {
+			w.Header().Set("Content-Type", contentType)
 		}
-		if link.Status == 0 {
-			w.WriteHeader(http.StatusOK)
-		} else {
-			w.WriteHeader(link.Status)
-		}
-		_, err = io.Copy(w, link.Data)
-		if err != nil {
-			return err
-		}
+		http.ServeContent(w, r, file.GetName(), file.ModTime(), link.MFile)
 		return nil
-	}
-	// local file
-	if link.FilePath != nil && *link.FilePath != "" {
-		f, err := os.Open(*link.FilePath)
-		if err != nil {
-			return err
-		}
+	} else if link.RangeReadCloser != nil {
+		attachFileName(w, file)
+		net.ServeHTTP(w, r, file.GetName(), file.ModTime(), file.GetSize(), link.RangeReadCloser.RangeRead)
 		defer func() {
-			_ = f.Close()
+			_ = link.RangeReadCloser.Close()
 		}()
-		fileStat, err := os.Stat(*link.FilePath)
-		if err != nil {
-			return err
+		return nil
+	} else if link.Concurrency != 0 || link.PartSize != 0 {
+		attachFileName(w, file)
+		size := file.GetSize()
+		//var finalClosers model.Closers
+		finalClosers := utils.EmptyClosers()
+		header := net.ProcessHeader(r.Header, link.Header)
+		rangeReader := func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+			down := net.NewDownloader(func(d *net.Downloader) {
+				d.Concurrency = link.Concurrency
+				d.PartSize = link.PartSize
+			})
+			req := &net.HttpRequestParams{
+				URL:       link.URL,
+				Range:     httpRange,
+				Size:      size,
+				HeaderRef: header,
+			}
+			rc, err := down.Download(ctx, req)
+			finalClosers.Add(rc)
+			return rc, err
 		}
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, file.GetName(), url.QueryEscape(file.GetName())))
-		http.ServeContent(w, r, file.GetName(), fileStat.ModTime(), f)
+		net.ServeHTTP(w, r, file.GetName(), file.ModTime(), file.GetSize(), rangeReader)
+		defer finalClosers.Close()
 		return nil
 	} else {
-		req, err := http.NewRequest(r.Method, link.URL, nil)
+		//transparent proxy
+		header := net.ProcessHeader(r.Header, link.Header)
+		res, err := net.RequestHttp(context.Background(), r.Method, header, link.URL)
 		if err != nil {
 			return err
 		}
-		for h, val := range r.Header {
-			if utils.SliceContains(conf.SlicesMap[conf.ProxyIgnoreHeaders], strings.ToLower(h)) {
-				continue
-			}
-			req.Header[h] = val
-		}
-		for h, val := range link.Header {
-			req.Header[h] = val
-		}
-		res, err := HttpClient.Do(req)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = res.Body.Close()
-		}()
-		log.Debugf("proxy status: %d", res.StatusCode)
-		// TODO clean header with blacklist or whitelist
-		res.Header.Del("set-cookie")
+		defer res.Body.Close()
+
 		for h, v := range res.Header {
 			w.Header()[h] = v
 		}
 		w.WriteHeader(res.StatusCode)
-		if res.StatusCode >= 400 {
-			all, _ := ioutil.ReadAll(res.Body)
-			msg := string(all)
-			log.Debugln(msg)
-			return errors.New(msg)
+		if r.Method == http.MethodHead {
+			return nil
 		}
 		_, err = io.Copy(w, res.Body)
 		if err != nil {
 			return err
 		}
 		return nil
+	}
+}
+func attachFileName(w http.ResponseWriter, file model.Obj) {
+	fileName := file.GetName()
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, fileName, url.PathEscape(fileName)))
+	w.Header().Set("Content-Type", utils.GetMimeType(fileName))
+}
+
+var NoProxyRange = &model.RangeReadCloser{}
+
+func ProxyRange(link *model.Link, size int64) {
+	if link.MFile != nil {
+		return
+	}
+	if link.RangeReadCloser == nil {
+		var rrc, err = stream.GetRangeReadCloserFromLink(size, link)
+		if err != nil {
+			log.Warnf("ProxyRange error: %s", err)
+			return
+		}
+		link.RangeReadCloser = rrc
+	} else if link.RangeReadCloser == NoProxyRange {
+		link.RangeReadCloser = nil
 	}
 }

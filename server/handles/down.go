@@ -2,6 +2,7 @@ package handles
 
 import (
 	"fmt"
+	"io"
 	stdpath "path"
 	"strings"
 
@@ -9,43 +10,44 @@ import (
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/fs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/setting"
 	"github.com/alist-org/alist/v3/internal/sign"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/alist-org/alist/v3/server/common"
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 )
 
 func Down(c *gin.Context) {
 	rawPath := c.MustGet("path").(string)
 	filename := stdpath.Base(rawPath)
-	storage, err := fs.GetStorage(rawPath)
+	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	if shouldProxy(storage, filename) {
+	if common.ShouldProxy(storage, filename) {
 		Proxy(c)
 		return
 	} else {
 		link, _, err := fs.Link(c, rawPath, model.LinkArgs{
-			IP:     c.ClientIP(),
-			Header: c.Request.Header,
-			Type:   c.Query("type"),
+			IP:      c.ClientIP(),
+			Header:  c.Request.Header,
+			Type:    c.Query("type"),
+			HttpReq: c.Request,
 		})
 		if err != nil {
 			common.ErrorResp(c, err, 500)
 			return
 		}
-		c.Header("Referrer-Policy", "no-referrer")
-		c.Header("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate")
-		c.Redirect(302, link.URL)
+		down(c, link)
 	}
 }
 
 func Proxy(c *gin.Context) {
 	rawPath := c.MustGet("path").(string)
 	filename := stdpath.Base(rawPath)
-	storage, err := fs.GetStorage(rawPath)
+	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
@@ -64,37 +66,68 @@ func Proxy(c *gin.Context) {
 			}
 		}
 		link, file, err := fs.Link(c, rawPath, model.LinkArgs{
-			Header: c.Request.Header,
-			Type:   c.Query("type"),
+			Header:  c.Request.Header,
+			Type:    c.Query("type"),
+			HttpReq: c.Request,
 		})
 		if err != nil {
 			common.ErrorResp(c, err, 500)
 			return
 		}
-		err = common.Proxy(c.Writer, c.Request, link, file)
-		if err != nil {
-			common.ErrorResp(c, err, 500, true)
-			return
-		}
+		localProxy(c, link, file, storage.GetStorage().ProxyRange)
 	} else {
 		common.ErrorStrResp(c, "proxy not allowed", 403)
 		return
 	}
 }
 
-// TODO need optimize
-// when should be proxy?
-// 1. config.MustProxy()
-// 2. storage.WebProxy
-// 3. proxy_types
-func shouldProxy(storage driver.Driver, filename string) bool {
-	if storage.Config().MustProxy() || storage.GetStorage().WebProxy {
-		return true
+func down(c *gin.Context, link *model.Link) {
+	var err error
+	if link.MFile != nil {
+		defer func(ReadSeekCloser io.ReadCloser) {
+			err := ReadSeekCloser.Close()
+			if err != nil {
+				log.Errorf("close data error: %s", err)
+			}
+		}(link.MFile)
 	}
-	if utils.SliceContains(conf.SlicesMap[conf.ProxyTypes], utils.Ext(filename)) {
-		return true
+	c.Header("Referrer-Policy", "no-referrer")
+	c.Header("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate")
+	if setting.GetBool(conf.ForwardDirectLinkParams) {
+		query := c.Request.URL.Query()
+		for _, v := range conf.SlicesMap[conf.IgnoreDirectLinkParams] {
+			query.Del(v)
+		}
+		link.URL, err = utils.InjectQuery(link.URL, query)
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
 	}
-	return false
+	c.Redirect(302, link.URL)
+}
+
+func localProxy(c *gin.Context, link *model.Link, file model.Obj, proxyRange bool) {
+	var err error
+	if link.URL != "" && setting.GetBool(conf.ForwardDirectLinkParams) {
+		query := c.Request.URL.Query()
+		for _, v := range conf.SlicesMap[conf.IgnoreDirectLinkParams] {
+			query.Del(v)
+		}
+		link.URL, err = utils.InjectQuery(link.URL, query)
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+	if proxyRange {
+		common.ProxyRange(link, file.GetSize())
+	}
+	err = common.Proxy(c.Writer, c.Request, link, file)
+	if err != nil {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
 }
 
 // TODO need optimize

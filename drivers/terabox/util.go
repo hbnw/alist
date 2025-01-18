@@ -1,47 +1,111 @@
-package terbox
+package terabox
 
 import (
 	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
-	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
-	"time"
+	log "github.com/sirupsen/logrus"
 )
 
-func (d *Terabox) request(furl string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+const (
+	initialChunkSize     int64 = 4 << 20 // 4MB
+	initialSizeThreshold int64 = 4 << 30 // 4GB
+)
+
+func getStrBetween(raw, start, end string) string {
+	regexPattern := fmt.Sprintf(`%s(.*?)%s`, regexp.QuoteMeta(start), regexp.QuoteMeta(end))
+	regex := regexp.MustCompile(regexPattern)
+	matches := regex.FindStringSubmatch(raw)
+	if len(matches) < 2 {
+		return ""
+	}
+	mid := matches[1]
+	return mid
+}
+
+func (d *Terabox) resetJsToken() error {
+	u := d.base_url
+	res, err := base.RestyClient.R().SetHeaders(map[string]string{
+		"Cookie":           d.Cookie,
+		"Accept":           "application/json, text/plain, */*",
+		"Referer":          d.base_url,
+		"User-Agent":       base.UserAgent,
+		"X-Requested-With": "XMLHttpRequest",
+	}).Get(u)
+	if err != nil {
+		return err
+	}
+	html := res.String()
+	jsToken := getStrBetween(html, "`function%20fn%28a%29%7Bwindow.jsToken%20%3D%20a%7D%3Bfn%28%22", "%22%29`")
+	if jsToken == "" {
+		return fmt.Errorf("jsToken not found, html: %s", html)
+	}
+	d.JsToken = jsToken
+	return nil
+}
+
+func (d *Terabox) request(rurl string, method string, callback base.ReqCallback, resp interface{}, noRetry ...bool) ([]byte, error) {
 	req := base.RestyClient.R()
 	req.SetHeaders(map[string]string{
 		"Cookie":           d.Cookie,
 		"Accept":           "application/json, text/plain, */*",
-		"Referer":          "https://www.terabox.com/",
+		"Referer":          d.base_url,
 		"User-Agent":       base.UserAgent,
 		"X-Requested-With": "XMLHttpRequest",
 	})
-	req.SetQueryParam("app_id", "250528")
-	req.SetQueryParam("web", "1")
-	req.SetQueryParam("channel", "dubox")
-	req.SetQueryParam("clienttype", "0")
+	req.SetQueryParams(map[string]string{
+		"app_id":     "250528",
+		"web":        "1",
+		"channel":    "dubox",
+		"clienttype": "0",
+		"jsToken":    d.JsToken,
+	})
 	if callback != nil {
 		callback(req)
 	}
 	if resp != nil {
 		req.SetResult(resp)
 	}
-	res, err := req.Execute(method, furl)
+	res, err := req.Execute(method, d.base_url+rurl)
 	if err != nil {
 		return nil, err
+	}
+	errno := utils.Json.Get(res.Body(), "errno").ToInt()
+	if errno == 4000023 {
+		// reget jsToken
+		err = d.resetJsToken()
+		if err != nil {
+			return nil, err
+		}
+		if !utils.IsBool(noRetry...) {
+			return d.request(rurl, method, callback, resp, true)
+		}
+	} else if errno == -6 {
+		header := res.Header()
+		log.Debugln(header)
+		urlDomainPrefix := header.Get("Url-Domain-Prefix")
+		if len(urlDomainPrefix) > 0 {
+			d.url_domain_prefix = urlDomainPrefix
+			d.base_url = "https://" + d.url_domain_prefix + ".terabox.com"
+			log.Debugln("Redirect base_url to", d.base_url)
+			return d.request(rurl, method, callback, resp, noRetry...)
+		}
 	}
 	return res.Body(), nil
 }
 
 func (d *Terabox) get(pathname string, params map[string]string, resp interface{}) ([]byte, error) {
-	return d.request("https://www.terabox.com"+pathname, http.MethodGet, func(req *resty.Request) {
+	return d.request(pathname, http.MethodGet, func(req *resty.Request) {
 		if params != nil {
 			req.SetQueryParams(params)
 		}
@@ -49,11 +113,20 @@ func (d *Terabox) get(pathname string, params map[string]string, resp interface{
 }
 
 func (d *Terabox) post(pathname string, params map[string]string, data interface{}, resp interface{}) ([]byte, error) {
-	return d.request("https://www.terabox.com"+pathname, http.MethodPost, func(req *resty.Request) {
+	return d.request(pathname, http.MethodPost, func(req *resty.Request) {
 		if params != nil {
 			req.SetQueryParams(params)
 		}
 		req.SetBody(data)
+	}, resp)
+}
+
+func (d *Terabox) post_form(pathname string, params map[string]string, data map[string]string, resp interface{}) ([]byte, error) {
+	return d.request(pathname, http.MethodPost, func(req *resty.Request) {
+		if params != nil {
+			req.SetQueryParams(params)
+		}
+		req.SetFormData(data)
 	}, resp)
 }
 
@@ -139,6 +212,11 @@ func (d *Terabox) linkOfficial(file model.Obj, args model.LinkArgs) (*model.Link
 	if err != nil {
 		return nil, err
 	}
+
+	if len(resp.Dlink) == 0 {
+		return nil, fmt.Errorf("fid %s no dlink found, errno: %d", file.GetID(), resp.Errno)
+	}
+
 	res, err := base.NoRedirectClient.R().SetHeader("Cookie", d.Cookie).SetHeader("User-Agent", base.UserAgent).Get(resp.Dlink[0].Dlink)
 	if err != nil {
 		return nil, err
@@ -180,21 +258,28 @@ func (d *Terabox) manage(opera string, filelist interface{}) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	data := fmt.Sprintf("async=0&filelist=%s&ondup=newcopy", string(marshal))
+	data := fmt.Sprintf("async=0&filelist=%s&ondup=newcopy", encodeURIComponent(string(marshal)))
 	return d.post("/api/filemanager", params, data, nil)
-}
-
-func (d *Terabox) create(path string, size int64, isdir int, uploadid, block_list string) ([]byte, error) {
-	params := map[string]string{}
-	data := fmt.Sprintf("path=%s&size=%d&isdir=%d", encodeURIComponent(path), size, isdir)
-	if uploadid != "" {
-		data += fmt.Sprintf("&uploadid=%s&block_list=%s", uploadid, block_list)
-	}
-	return d.post("/api/create", params, data, nil)
 }
 
 func encodeURIComponent(str string) string {
 	r := url.QueryEscape(str)
 	r = strings.ReplaceAll(r, "+", "%20")
 	return r
+}
+
+func calculateChunkSize(streamSize int64) int64 {
+	chunkSize := initialChunkSize
+	sizeThreshold := initialSizeThreshold
+
+	if streamSize < chunkSize {
+		return streamSize
+	}
+
+	for streamSize > sizeThreshold {
+		chunkSize <<= 1
+		sizeThreshold <<= 1
+	}
+
+	return chunkSize
 }

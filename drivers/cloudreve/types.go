@@ -1,8 +1,9 @@
 package cloudreve
 
 import (
-	"github.com/alist-org/alist/v3/internal/model"
 	"time"
+
+	"github.com/alist-org/alist/v3/internal/model"
 )
 
 type Resp struct {
@@ -20,9 +21,11 @@ type Policy struct {
 }
 
 type UploadInfo struct {
-	SessionID string `json:"sessionID"`
-	ChunkSize int    `json:"chunkSize"`
-	Expires   int    `json:"expires"`
+	SessionID  string   `json:"sessionID"`
+	ChunkSize  int      `json:"chunkSize"`
+	Expires    int      `json:"expires"`
+	UploadURLs []string `json:"uploadURLs"`
+	Credential string   `json:"credential,omitempty"`
 }
 
 type DirectoryResp struct {
@@ -43,12 +46,24 @@ type Object struct {
 	SourceEnabled bool      `json:"source_enabled"`
 }
 
-func objectToObj(f Object) *model.Object {
-	return &model.Object{
-		ID:       f.Id,
-		Name:     f.Name,
-		Size:     int64(f.Size),
-		Modified: f.Date,
-		IsFolder: f.Type == "dir",
+type DirectoryProp struct {
+	Size int `json:"size"`
+}
+
+func objectToObj(f Object, t model.Thumbnail) *model.ObjThumb {
+	return &model.ObjThumb{
+		Object: model.Object{
+			ID:       f.Id,
+			Name:     f.Name,
+			Size:     int64(f.Size),
+			Modified: f.Date,
+			IsFolder: f.Type == "dir",
+		},
+		Thumbnail: t,
 	}
+}
+
+type Config struct {
+	LoginCaptcha bool   `json:"loginCaptcha"`
+	CaptchaType  string `json:"captcha_type"`
 }

@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"strconv"
 	"time"
+
+	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/pkg/utils"
+	hash_extend "github.com/alist-org/alist/v3/pkg/utils/hash"
 )
 
 type ErrResp struct {
@@ -84,6 +88,8 @@ type Link struct {
 	Type   string    `json:"type"`
 }
 
+var _ model.Obj = (*Files)(nil)
+
 type Files struct {
 	Kind     string `json:"kind"`
 	ID       string `json:"id"`
@@ -100,39 +106,39 @@ type Files struct {
 	ModifiedTime   time.Time `json:"modified_time"`
 	IconLink       string    `json:"icon_link"`
 	ThumbnailLink  string    `json:"thumbnail_link"`
-	//Md5Checksum    string    `json:"md5_checksum"`
-	//Hash           string    `json:"hash"`
-	Links map[string]Link `json:"links"`
-	Phase string          `json:"phase"`
-	Audit struct {
-		Status  string `json:"status"`
-		Message string `json:"message"`
-		Title   string `json:"title"`
-	} `json:"audit"`
+	// Md5Checksum    string    `json:"md5_checksum"`
+	Hash string `json:"hash"`
+	// Links map[string]Link `json:"links"`
+	// Phase string          `json:"phase"`
+	// Audit struct {
+	// 	Status  string `json:"status"`
+	// 	Message string `json:"message"`
+	// 	Title   string `json:"title"`
+	// } `json:"audit"`
 	Medias []struct {
-		Category       string `json:"category"`
-		IconLink       string `json:"icon_link"`
-		IsDefault      bool   `json:"is_default"`
-		IsOrigin       bool   `json:"is_origin"`
-		IsVisible      bool   `json:"is_visible"`
-		Link           Link   `json:"link"`
-		MediaID        string `json:"media_id"`
-		MediaName      string `json:"media_name"`
-		NeedMoreQuota  bool   `json:"need_more_quota"`
-		Priority       int    `json:"priority"`
-		RedirectLink   string `json:"redirect_link"`
-		ResolutionName string `json:"resolution_name"`
-		Video          struct {
-			AudioCodec string `json:"audio_codec"`
-			BitRate    int    `json:"bit_rate"`
-			Duration   int    `json:"duration"`
-			FrameRate  int    `json:"frame_rate"`
-			Height     int    `json:"height"`
-			VideoCodec string `json:"video_codec"`
-			VideoType  string `json:"video_type"`
-			Width      int    `json:"width"`
-		} `json:"video"`
-		VipTypes []string `json:"vip_types"`
+		//Category       string `json:"category"`
+		//IconLink       string `json:"icon_link"`
+		//IsDefault      bool   `json:"is_default"`
+		//IsOrigin       bool   `json:"is_origin"`
+		//IsVisible      bool   `json:"is_visible"`
+		Link Link `json:"link"`
+		//MediaID        string `json:"media_id"`
+		//MediaName      string `json:"media_name"`
+		//NeedMoreQuota  bool   `json:"need_more_quota"`
+		//Priority       int    `json:"priority"`
+		//RedirectLink   string `json:"redirect_link"`
+		//ResolutionName string `json:"resolution_name"`
+		// Video          struct {
+		// 	AudioCodec string `json:"audio_codec"`
+		// 	BitRate    int    `json:"bit_rate"`
+		// 	Duration   int    `json:"duration"`
+		// 	FrameRate  int    `json:"frame_rate"`
+		// 	Height     int    `json:"height"`
+		// 	VideoCodec string `json:"video_codec"`
+		// 	VideoType  string `json:"video_type"`
+		// 	Width      int    `json:"width"`
+		// } `json:"video"`
+		// VipTypes []string `json:"vip_types"`
 	} `json:"medias"`
 	Trashed     bool   `json:"trashed"`
 	DeleteTime  string `json:"delete_time"`
@@ -146,13 +152,18 @@ type Files struct {
 	//Collection interface{} `json:"collection"`
 }
 
-func (c *Files) GetSize() int64     { size, _ := strconv.ParseInt(c.Size, 10, 64); return size }
-func (c *Files) GetName() string    { return c.Name }
-func (c *Files) ModTime() time.Time { return c.ModifiedTime }
-func (c *Files) IsDir() bool        { return c.Kind == FOLDER }
-func (c *Files) GetID() string      { return c.ID }
-func (c *Files) GetPath() string    { return "" }
-func (c *Files) Thumb() string      { return c.ThumbnailLink }
+func (c *Files) GetHash() utils.HashInfo {
+	return utils.NewHashInfo(hash_extend.GCID, c.Hash)
+}
+
+func (c *Files) GetSize() int64        { size, _ := strconv.ParseInt(c.Size, 10, 64); return size }
+func (c *Files) GetName() string       { return c.Name }
+func (c *Files) CreateTime() time.Time { return c.CreatedTime }
+func (c *Files) ModTime() time.Time    { return c.ModifiedTime }
+func (c *Files) IsDir() bool           { return c.Kind == FOLDER }
+func (c *Files) GetID() string         { return c.ID }
+func (c *Files) GetPath() string       { return "" }
+func (c *Files) Thumb() string         { return c.ThumbnailLink }
 
 /*
 * 上传
@@ -192,4 +203,51 @@ type UploadTaskResponse struct {
 	} `json:"resumable"`
 
 	File Files `json:"file"`
+}
+
+// 添加离线下载响应
+type OfflineDownloadResp struct {
+	File       *string     `json:"file"`
+	Task       OfflineTask `json:"task"`
+	UploadType string      `json:"upload_type"`
+	URL        struct {
+		Kind string `json:"kind"`
+	} `json:"url"`
+}
+
+// 离线下载列表
+type OfflineListResp struct {
+	ExpiresIn     int64         `json:"expires_in"`
+	NextPageToken string        `json:"next_page_token"`
+	Tasks         []OfflineTask `json:"tasks"`
+}
+
+// offlineTask
+type OfflineTask struct {
+	Callback    string   `json:"callback"`
+	CreatedTime string   `json:"created_time"`
+	FileID      string   `json:"file_id"`
+	FileName    string   `json:"file_name"`
+	FileSize    string   `json:"file_size"`
+	IconLink    string   `json:"icon_link"`
+	ID          string   `json:"id"`
+	Kind        string   `json:"kind"`
+	Message     string   `json:"message"`
+	Name        string   `json:"name"`
+	Params      Params   `json:"params"`
+	Phase       string   `json:"phase"` // PHASE_TYPE_RUNNING, PHASE_TYPE_ERROR, PHASE_TYPE_COMPLETE, PHASE_TYPE_PENDING
+	Progress    int64    `json:"progress"`
+	Space       string   `json:"space"`
+	StatusSize  int64    `json:"status_size"`
+	Statuses    []string `json:"statuses"`
+	ThirdTaskID string   `json:"third_task_id"`
+	Type        string   `json:"type"`
+	UpdatedTime string   `json:"updated_time"`
+	UserID      string   `json:"user_id"`
+}
+
+type Params struct {
+	FolderType   string `json:"folder_type"`
+	PredictSpeed string `json:"predict_speed"`
+	PredictType  string `json:"predict_type"`
 }

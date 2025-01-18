@@ -6,20 +6,24 @@ import (
 )
 
 type Addition struct {
-	Account string `json:"account" required:"true"`
-	Cookie  string `json:"cookie" type:"text" required:"true"`
+	//Account       string `json:"account" required:"true"`
+	Authorization string `json:"authorization" type:"text" required:"true"`
 	driver.RootID
-	Type    string `json:"type" type:"select" options:"personal,family" default:"personal"`
-	CloudID string `json:"cloud_id"`
+	Type                 string `json:"type" type:"select" options:"personal_new,family,group,personal" default:"personal_new"`
+	CloudID              string `json:"cloud_id"`
+	CustomUploadPartSize int64  `json:"custom_upload_part_size" type:"number" default:"0" help:"0 for auto"`
 }
 
 var config = driver.Config{
-	Name:      "139Yun",
-	LocalSort: true,
+	Name:             "139Yun",
+	LocalSort:        true,
+	ProxyRangeOption: true,
 }
 
 func init() {
 	op.RegisterDriver(func() driver.Driver {
-		return &Yun139{}
+		d := &Yun139{}
+		d.ProxyRange = true
+		return d
 	})
 }

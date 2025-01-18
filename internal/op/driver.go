@@ -10,21 +10,21 @@ import (
 	"github.com/pkg/errors"
 )
 
-type New func() driver.Driver
+type DriverConstructor func() driver.Driver
 
-var driverNewMap = map[string]New{}
+var driverMap = map[string]DriverConstructor{}
 var driverInfoMap = map[string]driver.Info{}
 
-func RegisterDriver(driver New) {
+func RegisterDriver(driver DriverConstructor) {
 	// log.Infof("register driver: [%s]", config.Name)
 	tempDriver := driver()
 	tempConfig := tempDriver.Config()
 	registerDriverItems(tempConfig, tempDriver.GetAddition())
-	driverNewMap[tempConfig.Name] = driver
+	driverMap[tempConfig.Name] = driver
 }
 
-func GetDriverNew(name string) (New, error) {
-	n, ok := driverNewMap[name]
+func GetDriver(name string) (DriverConstructor, error) {
+	n, ok := driverMap[name]
 	if !ok {
 		return nil, errors.Errorf("no driver named: %s", name)
 	}
@@ -63,7 +63,7 @@ func getMainItems(config driver.Config) []driver.Item {
 		Name:     "mount_path",
 		Type:     conf.TypeString,
 		Required: true,
-		Help:     "",
+		Help:     "The path you want to mount to, it is unique and cannot be repeated",
 	}, {
 		Name: "order",
 		Type: conf.TypeNumber,
@@ -93,6 +93,17 @@ func getMainItems(config driver.Config) []driver.Item {
 			Required: true,
 		},
 		}...)
+		if config.ProxyRangeOption {
+			item := driver.Item{
+				Name: "proxy_range",
+				Type: conf.TypeBool,
+				Help: "Need to enable proxy",
+			}
+			if config.Name == "139Yun" {
+				item.Default = "true"
+			}
+			items = append(items, item)
+		}
 	} else {
 		items = append(items, driver.Item{
 			Name:     "webdav_policy",
@@ -122,9 +133,20 @@ func getMainItems(config driver.Config) []driver.Item {
 		Type:    conf.TypeSelect,
 		Options: "front,back",
 	})
+	items = append(items, driver.Item{
+		Name:     "disable_index",
+		Type:     conf.TypeBool,
+		Default:  "false",
+		Required: true,
+	})
+	items = append(items, driver.Item{
+		Name:     "enable_sign",
+		Type:     conf.TypeBool,
+		Default:  "false",
+		Required: true,
+	})
 	return items
 }
-
 func getAdditionalItems(t reflect.Type, defaultRoot string) []driver.Item {
 	var items []driver.Item
 	for i := 0; i < t.NumField(); i++ {

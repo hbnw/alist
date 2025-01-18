@@ -1,17 +1,18 @@
 package _123
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -29,7 +30,7 @@ import (
 type Pan123 struct {
 	model.Storage
 	Addition
-	AccessToken string
+	apiRateLimit sync.Map
 }
 
 func (d *Pan123) Config() driver.Config {
@@ -41,15 +42,19 @@ func (d *Pan123) GetAddition() driver.Additional {
 }
 
 func (d *Pan123) Init(ctx context.Context) error {
-	return d.login()
+	_, err := d.Request(UserInfo, http.MethodGet, nil, nil)
+	return err
 }
 
 func (d *Pan123) Drop(ctx context.Context) error {
+	_, _ = d.Request(Logout, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(base.Json{})
+	}, nil)
 	return nil
 }
 
 func (d *Pan123) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	files, err := d.getFiles(dir.GetID())
+	files, err := d.getFiles(ctx, dir.GetID(), dir.GetName())
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +82,8 @@ func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 			"size":      f.Size,
 			"type":      f.Type,
 		}
-		resp, err := d.request("https://www.123pan.com/api/file/download_info", http.MethodPost, func(req *resty.Request) {
+		resp, err := d.Request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
+
 			req.SetBody(data).SetHeaders(headers)
 		}, nil)
 		if err != nil {
@@ -96,18 +102,24 @@ func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 				return nil, err
 			}
 		}
-		u_ := fmt.Sprintf("https://%s%s", u.Host, u.Path)
-		res, err := base.NoRedirectClient.R().SetQueryParamsFromValues(u.Query()).Head(u_)
+		u_ := u.String()
+		log.Debug("download url: ", u_)
+		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://www.123pan.com/").Get(u_)
 		if err != nil {
 			return nil, err
 		}
 		log.Debug(res.String())
 		link := model.Link{
-			URL: downloadUrl,
+			URL: u_,
 		}
 		log.Debugln("res code: ", res.StatusCode())
 		if res.StatusCode() == 302 {
 			link.URL = res.Header().Get("location")
+		} else if res.StatusCode() < 300 {
+			link.URL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
+		}
+		link.Header = http.Header{
+			"Referer": []string{"https://www.123pan.com/"},
 		}
 		return &link, nil
 	} else {
@@ -124,7 +136,7 @@ func (d *Pan123) MakeDir(ctx context.Context, parentDir model.Obj, dirName strin
 		"size":         0,
 		"type":         1,
 	}
-	_, err := d.request("https://www.123pan.com/api/file/upload_request", http.MethodPost, func(req *resty.Request) {
+	_, err := d.Request(Mkdir, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
 	return err
@@ -135,7 +147,7 @@ func (d *Pan123) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 		"fileIdList":   []base.Json{{"FileId": srcObj.GetID()}},
 		"parentFileId": dstDir.GetID(),
 	}
-	_, err := d.request("https://www.123pan.com/api/file/mod_pid", http.MethodPost, func(req *resty.Request) {
+	_, err := d.Request(Move, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
 	return err
@@ -147,7 +159,7 @@ func (d *Pan123) Rename(ctx context.Context, srcObj model.Obj, newName string) e
 		"fileId":   srcObj.GetID(),
 		"fileName": newName,
 	}
-	_, err := d.request("https://www.123pan.com/api/file/rename", http.MethodPost, func(req *resty.Request) {
+	_, err := d.Request(Rename, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
 	return err
@@ -164,7 +176,7 @@ func (d *Pan123) Remove(ctx context.Context, obj model.Obj) error {
 			"operation":         true,
 			"fileTrashInfoList": []File{f},
 		}
-		_, err := d.request("https://www.123pan.com/b/api/file/trash", http.MethodPost, func(req *resty.Request) {
+		_, err := d.Request(Trash, http.MethodPost, func(req *resty.Request) {
 			req.SetBody(data)
 		}, nil)
 		return err
@@ -174,40 +186,22 @@ func (d *Pan123) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	const DEFAULT int64 = 10485760
-	var uploadFile io.Reader
+	// const DEFAULT int64 = 10485760
 	h := md5.New()
-	if d.StreamUpload && stream.GetSize() > DEFAULT {
-		// 只计算前10MIB
-		buf := bytes.NewBuffer(make([]byte, 0, DEFAULT))
-		if n, err := io.CopyN(io.MultiWriter(buf, h), stream, DEFAULT); err != io.EOF && n == 0 {
-			return err
-		}
-		// 增加额外参数防止MD5碰撞
-		h.Write([]byte(stream.GetName()))
-		num := make([]byte, 8)
-		binary.BigEndian.PutUint64(num, uint64(stream.GetSize()))
-		h.Write(num)
-		// 拼装
-		uploadFile = io.MultiReader(buf, stream)
-	} else {
-		// 计算完整文件MD5
-		tempFile, err := utils.CreateTempFile(stream.GetReadCloser())
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = tempFile.Close()
-			_ = os.Remove(tempFile.Name())
-		}()
-		if _, err = io.Copy(h, tempFile); err != nil {
-			return err
-		}
-		_, err = tempFile.Seek(0, io.SeekStart)
-		if err != nil {
-			return err
-		}
-		uploadFile = tempFile
+	// need to calculate md5 of the full content
+	tempFile, err := stream.CacheFullInTempFile()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tempFile.Close()
+	}()
+	if _, err = utils.CopyWithBuffer(h, tempFile); err != nil {
+		return err
+	}
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
 	}
 	etag := hex.EncodeToString(h.Sum(nil))
 	data := base.Json{
@@ -220,41 +214,55 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		"type":         0,
 	}
 	var resp UploadResp
-	_, err := d.request("https://www.123pan.com/a/api/file/upload_request", http.MethodPost, func(req *resty.Request) {
+	res, err := d.Request(UploadRequest, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data).SetContext(ctx)
 	}, &resp)
 	if err != nil {
 		return err
 	}
+	log.Debugln("upload request res: ", string(res))
 	if resp.Data.Reuse || resp.Data.Key == "" {
 		return nil
 	}
-	cfg := &aws.Config{
-		Credentials:      credentials.NewStaticCredentials(resp.Data.AccessKeyId, resp.Data.SecretAccessKey, resp.Data.SessionToken),
-		Region:           aws.String("123pan"),
-		Endpoint:         aws.String("file.123pan.com"),
-		S3ForcePathStyle: aws.Bool(true),
-	}
-	s, err := session.NewSession(cfg)
-	if err != nil {
+	if resp.Data.AccessKeyId == "" || resp.Data.SecretAccessKey == "" || resp.Data.SessionToken == "" {
+		err = d.newUpload(ctx, &resp, stream, tempFile, up)
 		return err
+	} else {
+		cfg := &aws.Config{
+			Credentials:      credentials.NewStaticCredentials(resp.Data.AccessKeyId, resp.Data.SecretAccessKey, resp.Data.SessionToken),
+			Region:           aws.String("123pan"),
+			Endpoint:         aws.String(resp.Data.EndPoint),
+			S3ForcePathStyle: aws.Bool(true),
+		}
+		s, err := session.NewSession(cfg)
+		if err != nil {
+			return err
+		}
+		uploader := s3manager.NewUploader(s)
+		if stream.GetSize() > s3manager.MaxUploadParts*s3manager.DefaultUploadPartSize {
+			uploader.PartSize = stream.GetSize() / (s3manager.MaxUploadParts - 1)
+		}
+		input := &s3manager.UploadInput{
+			Bucket: &resp.Data.Bucket,
+			Key:    &resp.Data.Key,
+			Body:   tempFile,
+		}
+		_, err = uploader.UploadWithContext(ctx, input)
 	}
-	uploader := s3manager.NewUploader(s)
-	input := &s3manager.UploadInput{
-		Bucket: &resp.Data.Bucket,
-		Key:    &resp.Data.Key,
-		Body:   uploadFile,
-	}
-	_, err = uploader.UploadWithContext(ctx, input)
-	if err != nil {
-		return err
-	}
-	_, err = d.request("https://www.123pan.com/api/file/upload_complete", http.MethodPost, func(req *resty.Request) {
+	_, err = d.Request(UploadComplete, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"fileId": resp.Data.FileId,
 		}).SetContext(ctx)
 	}, nil)
 	return err
+}
+
+func (d *Pan123) APIRateLimit(ctx context.Context, api string) error {
+	value, _ := d.apiRateLimit.LoadOrStore(api,
+		rate.NewLimiter(rate.Every(700*time.Millisecond), 1))
+	limiter := value.(*rate.Limiter)
+
+	return limiter.Wait(ctx)
 }
 
 var _ driver.Driver = (*Pan123)(nil)

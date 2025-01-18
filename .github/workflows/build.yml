@@ -6,25 +6,33 @@ on:
   pull_request:
     branches: [ 'main' ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     strategy:
       matrix:
         platform: [ubuntu-latest]
-        go-version: [1.19]
+        go-version: [ '1.21' ]
     name: Build
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Setup Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
 
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - uses: benjlevesque/short-sha@v3.0
+        id: short-sha
 
       - name: Install dependencies
         run: |
+          sudo snap install zig --classic --beta
           docker pull crazymax/xgo:latest
           go install github.com/crazy-max/xgo@latest
           sudo apt install upx
@@ -34,7 +42,7 @@ jobs:
           bash build.sh dev
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: alist
+          name: alist_${{ env.SHA }}
           path: dist

@@ -4,6 +4,7 @@ import (
 	"github.com/alist-org/alist/v3/cmd/flags"
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/message"
+	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/alist-org/alist/v3/server/common"
 	"github.com/alist-org/alist/v3/server/handles"
 	"github.com/alist-org/alist/v3/server/middlewares"
@@ -12,41 +13,87 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func Init(r *gin.Engine) {
-	common.SecretKey = []byte(conf.Conf.JwtSecret)
-	Cors(r)
-	r.Use(middlewares.StoragesLoaded)
-	if conf.Conf.MaxConnections > 0 {
-		r.Use(middlewares.MaxAllowed(conf.Conf.MaxConnections))
+func Init(e *gin.Engine) {
+	if !utils.SliceContains([]string{"", "/"}, conf.URL.Path) {
+		e.GET("/", func(c *gin.Context) {
+			c.Redirect(302, conf.URL.Path)
+		})
 	}
-	WebDav(r.Group("/dav"))
+	Cors(e)
+	g := e.Group(conf.URL.Path)
+	if conf.Conf.Scheme.HttpPort != -1 && conf.Conf.Scheme.HttpsPort != -1 && conf.Conf.Scheme.ForceHttps {
+		e.Use(middlewares.ForceHttps)
+	}
+	g.Any("/ping", func(c *gin.Context) {
+		c.String(200, "pong")
+	})
+	g.GET("/favicon.ico", handles.Favicon)
+	g.GET("/robots.txt", handles.Robots)
+	g.GET("/i/:link_name", handles.Plist)
+	common.SecretKey = []byte(conf.Conf.JwtSecret)
+	g.Use(middlewares.StoragesLoaded)
+	if conf.Conf.MaxConnections > 0 {
+		g.Use(middlewares.MaxAllowed(conf.Conf.MaxConnections))
+	}
+	WebDav(g.Group("/dav"))
+	S3(g.Group("/s3"))
 
-	r.GET("/favicon.ico", handles.Favicon)
-	r.GET("/i/:link_name", handles.Plist)
-	r.GET("/d/*path", middlewares.Down, handles.Down)
-	r.GET("/p/*path", middlewares.Down, handles.Proxy)
+	g.GET("/d/*path", middlewares.Down, handles.Down)
+	g.GET("/p/*path", middlewares.Down, handles.Proxy)
+	g.HEAD("/d/*path", middlewares.Down, handles.Down)
+	g.HEAD("/p/*path", middlewares.Down, handles.Proxy)
+	g.GET("/ad/*path", middlewares.Down, handles.ArchiveDown)
+	g.GET("/ap/*path", middlewares.Down, handles.ArchiveProxy)
+	g.GET("/ae/*path", middlewares.Down, handles.ArchiveInternalExtract)
+	g.HEAD("/ad/*path", middlewares.Down, handles.ArchiveDown)
+	g.HEAD("/ap/*path", middlewares.Down, handles.ArchiveProxy)
+	g.HEAD("/ae/*path", middlewares.Down, handles.ArchiveInternalExtract)
 
-	api := r.Group("/api")
+	api := g.Group("/api")
 	auth := api.Group("", middlewares.Auth)
+	webauthn := api.Group("/authn", middlewares.Authn)
 
 	api.POST("/auth/login", handles.Login)
+	api.POST("/auth/login/hash", handles.LoginHash)
+	api.POST("/auth/login/ldap", handles.LoginLdap)
 	auth.GET("/me", handles.CurrentUser)
 	auth.POST("/me/update", handles.UpdateCurrent)
+	auth.GET("/me/sshkey/list", handles.ListMyPublicKey)
+	auth.POST("/me/sshkey/add", handles.AddMyPublicKey)
+	auth.POST("/me/sshkey/delete", handles.DeleteMyPublicKey)
 	auth.POST("/auth/2fa/generate", handles.Generate2FA)
 	auth.POST("/auth/2fa/verify", handles.Verify2FA)
-	auth.GET("/auth/github", handles.GithubLoginRedirect)
-	auth.GET("/auth/github_callback", handles.GithubLoginCallback)
+	auth.GET("/auth/logout", handles.LogOut)
+
+	// auth
+	api.GET("/auth/sso", handles.SSOLoginRedirect)
+	api.GET("/auth/sso_callback", handles.SSOLoginCallback)
+	api.GET("/auth/get_sso_id", handles.SSOLoginCallback)
+	api.GET("/auth/sso_get_token", handles.SSOLoginCallback)
+
+	// webauthn
+	webauthn.GET("/webauthn_begin_registration", handles.BeginAuthnRegistration)
+	webauthn.POST("/webauthn_finish_registration", handles.FinishAuthnRegistration)
+	webauthn.GET("/webauthn_begin_login", handles.BeginAuthnLogin)
+	webauthn.POST("/webauthn_finish_login", handles.FinishAuthnLogin)
+	webauthn.POST("/delete_authn", handles.DeleteAuthnLogin)
+	webauthn.GET("/getcredentials", handles.GetAuthnCredentials)
 
 	// no need auth
 	public := api.Group("/public")
 	public.Any("/settings", handles.PublicSettings)
+	public.Any("/offline_download_tools", handles.OfflineDownloadTools)
+	public.Any("/archive_extensions", handles.ArchiveExtensions)
 
 	_fs(auth.Group("/fs"))
+	_task(auth.Group("/task", middlewares.AuthNotGuest))
 	admin(auth.Group("/admin", middlewares.AuthAdmin))
-	if flags.Dev {
-		dev(r.Group("/dev"))
+	if flags.Debug || flags.Dev {
+		debug(g.Group("/debug"))
 	}
-	static.Static(r)
+	static.Static(g, func(handlers ...gin.HandlerFunc) {
+		e.NoRoute(handlers...)
+	})
 }
 
 func admin(g *gin.RouterGroup) {
@@ -64,6 +111,9 @@ func admin(g *gin.RouterGroup) {
 	user.POST("/update", handles.UpdateUser)
 	user.POST("/cancel_2fa", handles.Cancel2FAById)
 	user.POST("/delete", handles.DeleteUser)
+	user.POST("/del_cache", handles.DelUserCache)
+	user.GET("/sshkey/list", handles.ListPublicKeys)
+	user.POST("/sshkey/delete", handles.DeletePublicKey)
 
 	storage := g.Group("/storage")
 	storage.GET("/list", handles.ListStorages)
@@ -87,28 +137,14 @@ func admin(g *gin.RouterGroup) {
 	setting.POST("/delete", handles.DeleteSetting)
 	setting.POST("/reset_token", handles.ResetToken)
 	setting.POST("/set_aria2", handles.SetAria2)
+	setting.POST("/set_qbit", handles.SetQbittorrent)
+	setting.POST("/set_transmission", handles.SetTransmission)
+	setting.POST("/set_115", handles.Set115)
+	setting.POST("/set_pikpak", handles.SetPikPak)
+	setting.POST("/set_thunder", handles.SetThunder)
 
-	task := g.Group("/task")
-	task.GET("/down/undone", handles.UndoneDownTask)
-	task.GET("/down/done", handles.DoneDownTask)
-	task.POST("/down/cancel", handles.CancelDownTask)
-	task.POST("/down/delete", handles.DeleteDownTask)
-	task.POST("/down/clear_done", handles.ClearDoneDownTasks)
-	task.GET("/transfer/undone", handles.UndoneTransferTask)
-	task.GET("/transfer/done", handles.DoneTransferTask)
-	task.POST("/transfer/cancel", handles.CancelTransferTask)
-	task.POST("/transfer/delete", handles.DeleteTransferTask)
-	task.POST("/transfer/clear_done", handles.ClearDoneTransferTasks)
-	task.GET("/upload/undone", handles.UndoneUploadTask)
-	task.GET("/upload/done", handles.DoneUploadTask)
-	task.POST("/upload/cancel", handles.CancelUploadTask)
-	task.POST("/upload/delete", handles.DeleteUploadTask)
-	task.POST("/upload/clear_done", handles.ClearDoneUploadTasks)
-	task.GET("/copy/undone", handles.UndoneCopyTask)
-	task.GET("/copy/done", handles.DoneCopyTask)
-	task.POST("/copy/cancel", handles.CancelCopyTask)
-	task.POST("/copy/delete", handles.DeleteCopyTask)
-	task.POST("/copy/clear_done", handles.ClearDoneCopyTasks)
+	// retain /admin/task API to ensure compatibility with legacy automation scripts
+	_task(g.Group("/task"))
 
 	ms := g.Group("/message")
 	ms.POST("/get", message.HttpInstance.GetHandle)
@@ -130,20 +166,40 @@ func _fs(g *gin.RouterGroup) {
 	g.Any("/dirs", handles.FsDirs)
 	g.POST("/mkdir", handles.FsMkdir)
 	g.POST("/rename", handles.FsRename)
+	g.POST("/batch_rename", handles.FsBatchRename)
+	g.POST("/regex_rename", handles.FsRegexRename)
 	g.POST("/move", handles.FsMove)
+	g.POST("/recursive_move", handles.FsRecursiveMove)
 	g.POST("/copy", handles.FsCopy)
 	g.POST("/remove", handles.FsRemove)
+	g.POST("/remove_empty_directory", handles.FsRemoveEmptyDirectory)
 	g.PUT("/put", middlewares.FsUp, handles.FsStream)
 	g.PUT("/form", middlewares.FsUp, handles.FsForm)
 	g.POST("/link", middlewares.AuthAdmin, handles.Link)
-	g.POST("/add_aria2", handles.AddAria2)
+	// g.POST("/add_aria2", handles.AddOfflineDownload)
+	// g.POST("/add_qbit", handles.AddQbittorrent)
+	// g.POST("/add_transmission", handles.SetTransmission)
+	g.POST("/add_offline_download", handles.AddOfflineDownload)
+	a := g.Group("/archive")
+	a.Any("/meta", handles.FsArchiveMeta)
+	a.Any("/list", handles.FsArchiveList)
+	a.POST("/decompress", handles.FsArchiveDecompress)
+}
+
+func _task(g *gin.RouterGroup) {
+	handles.SetupTaskRoute(g)
 }
 
 func Cors(r *gin.Engine) {
 	config := cors.DefaultConfig()
-	config.AllowAllOrigins = true
-	//config.AllowHeaders = append(config.AllowHeaders, "Authorization", "range", "File-Path", "As-Task", "Password")
-	config.AllowHeaders = []string{"*"}
-	config.AllowMethods = []string{"*"}
+	// config.AllowAllOrigins = true
+	config.AllowOrigins = conf.Conf.Cors.AllowOrigins
+	config.AllowHeaders = conf.Conf.Cors.AllowHeaders
+	config.AllowMethods = conf.Conf.Cors.AllowMethods
 	r.Use(cors.New(config))
+}
+
+func InitS3(e *gin.Engine) {
+	Cors(e)
+	S3Server(e.Group("/"))
 }

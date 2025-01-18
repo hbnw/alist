@@ -1,212 +1,225 @@
 package handles
 
 import (
-	"strconv"
+	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/task"
+	"math"
+	"time"
 
-	"github.com/alist-org/alist/v3/internal/aria2"
 	"github.com/alist-org/alist/v3/internal/fs"
-	"github.com/alist-org/alist/v3/pkg/task"
+	"github.com/alist-org/alist/v3/internal/offline_download/tool"
+	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/alist-org/alist/v3/server/common"
 	"github.com/gin-gonic/gin"
+	"github.com/xhofe/tache"
 )
 
 type TaskInfo struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	State    string `json:"state"`
-	Status   string `json:"status"`
-	Progress int    `json:"progress"`
-	Error    string `json:"error"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Creator     string      `json:"creator"`
+	CreatorRole int         `json:"creator_role"`
+	State       tache.State `json:"state"`
+	Status      string      `json:"status"`
+	Progress    float64     `json:"progress"`
+	StartTime   *time.Time  `json:"start_time"`
+	EndTime     *time.Time  `json:"end_time"`
+	TotalBytes  int64       `json:"total_bytes"`
+	Error       string      `json:"error"`
 }
 
-func getTaskInfoUint(task *task.Task[uint64]) TaskInfo {
+func getTaskInfo[T task.TaskExtensionInfo](task T) TaskInfo {
+	errMsg := ""
+	if task.GetErr() != nil {
+		errMsg = task.GetErr().Error()
+	}
+	progress := task.GetProgress()
+	// if progress is NaN, set it to 100
+	if math.IsNaN(progress) {
+		progress = 100
+	}
+	creatorName := ""
+	creatorRole := -1
+	if task.GetCreator() != nil {
+		creatorName = task.GetCreator().Username
+		creatorRole = task.GetCreator().Role
+	}
 	return TaskInfo{
-		ID:       strconv.FormatUint(task.ID, 10),
-		Name:     task.Name,
-		State:    task.GetState(),
-		Status:   task.GetStatus(),
-		Progress: task.GetProgress(),
-		Error:    task.GetErrMsg(),
+		ID:          task.GetID(),
+		Name:        task.GetName(),
+		Creator:     creatorName,
+		CreatorRole: creatorRole,
+		State:       task.GetState(),
+		Status:      task.GetStatus(),
+		Progress:    progress,
+		StartTime:   task.GetStartTime(),
+		EndTime:     task.GetEndTime(),
+		TotalBytes:  task.GetTotalBytes(),
+		Error:       errMsg,
 	}
 }
 
-func getTaskInfoStr(task *task.Task[string]) TaskInfo {
-	return TaskInfo{
-		ID:       task.ID,
-		Name:     task.Name,
-		State:    task.GetState(),
-		Status:   task.GetStatus(),
-		Progress: task.GetProgress(),
-		Error:    task.GetErrMsg(),
-	}
+func getTaskInfos[T task.TaskExtensionInfo](tasks []T) []TaskInfo {
+	return utils.MustSliceConvert(tasks, getTaskInfo[T])
 }
 
-func getTaskInfosUint(tasks []*task.Task[uint64]) []TaskInfo {
-	var infos []TaskInfo
-	for _, t := range tasks {
-		infos = append(infos, getTaskInfoUint(t))
-	}
-	return infos
+func argsContains[T comparable](v T, slice ...T) bool {
+	return utils.SliceContains(slice, v)
 }
 
-func getTaskInfosStr(tasks []*task.Task[string]) []TaskInfo {
-	var infos []TaskInfo
-	for _, t := range tasks {
-		infos = append(infos, getTaskInfoStr(t))
-	}
-	return infos
-}
-
-func UndoneDownTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosStr(aria2.DownTaskManager.ListUndone()))
-}
-
-func DoneDownTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosStr(aria2.DownTaskManager.ListDone()))
-}
-
-func CancelDownTask(c *gin.Context) {
-	tid := c.Query("tid")
-	if err := aria2.DownTaskManager.Cancel(tid); err != nil {
-		common.ErrorResp(c, err, 500)
+func getUserInfo(c *gin.Context) (bool, uint, bool) {
+	if user, ok := c.Value("user").(*model.User); ok {
+		return user.IsAdmin(), user.ID, true
 	} else {
+		return false, 0, false
+	}
+}
+
+func getTargetedHandler[T task.TaskExtensionInfo](manager task.Manager[T], callback func(c *gin.Context, task T)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		isAdmin, uid, ok := getUserInfo(c)
+		if !ok {
+			// if there is no bug, here is unreachable
+			common.ErrorStrResp(c, "user invalid", 401)
+			return
+		}
+		t, ok := manager.GetByID(c.Query("tid"))
+		if !ok {
+			common.ErrorStrResp(c, "task not found", 404)
+			return
+		}
+		if !isAdmin && uid != t.GetCreator().ID {
+			// to avoid an attacker using error messages to guess valid TID, return a 404 rather than a 403
+			common.ErrorStrResp(c, "task not found", 404)
+			return
+		}
+		callback(c, t)
+	}
+}
+
+func getBatchHandler[T task.TaskExtensionInfo](manager task.Manager[T], callback func(task T)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		isAdmin, uid, ok := getUserInfo(c)
+		if !ok {
+			common.ErrorStrResp(c, "user invalid", 401)
+			return
+		}
+		var tids []string
+		if err := c.ShouldBind(&tids); err != nil {
+			common.ErrorStrResp(c, "invalid request format", 400)
+			return
+		}
+		retErrs := make(map[string]string)
+		for _, tid := range tids {
+			t, ok := manager.GetByID(tid)
+			if !ok || (!isAdmin && uid != t.GetCreator().ID) {
+				retErrs[tid] = "task not found"
+				continue
+			}
+			callback(t)
+		}
+		common.SuccessResp(c, retErrs)
+	}
+}
+
+func taskRoute[T task.TaskExtensionInfo](g *gin.RouterGroup, manager task.Manager[T]) {
+	g.GET("/undone", func(c *gin.Context) {
+		isAdmin, uid, ok := getUserInfo(c)
+		if !ok {
+			// if there is no bug, here is unreachable
+			common.ErrorStrResp(c, "user invalid", 401)
+			return
+		}
+		common.SuccessResp(c, getTaskInfos(manager.GetByCondition(func(task T) bool {
+			// avoid directly passing the user object into the function to reduce closure size
+			return (isAdmin || uid == task.GetCreator().ID) &&
+				argsContains(task.GetState(), tache.StatePending, tache.StateRunning, tache.StateCanceling,
+					tache.StateErrored, tache.StateFailing, tache.StateWaitingRetry, tache.StateBeforeRetry)
+		})))
+	})
+	g.GET("/done", func(c *gin.Context) {
+		isAdmin, uid, ok := getUserInfo(c)
+		if !ok {
+			// if there is no bug, here is unreachable
+			common.ErrorStrResp(c, "user invalid", 401)
+			return
+		}
+		common.SuccessResp(c, getTaskInfos(manager.GetByCondition(func(task T) bool {
+			return (isAdmin || uid == task.GetCreator().ID) &&
+				argsContains(task.GetState(), tache.StateCanceled, tache.StateFailed, tache.StateSucceeded)
+		})))
+	})
+	g.POST("/info", getTargetedHandler(manager, func(c *gin.Context, task T) {
+		common.SuccessResp(c, getTaskInfo(task))
+	}))
+	g.POST("/cancel", getTargetedHandler(manager, func(c *gin.Context, task T) {
+		manager.Cancel(task.GetID())
 		common.SuccessResp(c)
-	}
-}
-
-func DeleteDownTask(c *gin.Context) {
-	tid := c.Query("tid")
-	if err := aria2.DownTaskManager.Remove(tid); err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
+	}))
+	g.POST("/delete", getTargetedHandler(manager, func(c *gin.Context, task T) {
+		manager.Remove(task.GetID())
 		common.SuccessResp(c)
-	}
-}
-
-func ClearDoneDownTasks(c *gin.Context) {
-	aria2.DownTaskManager.ClearDone()
-	common.SuccessResp(c)
-}
-
-func UndoneTransferTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosUint(aria2.TransferTaskManager.ListUndone()))
-}
-
-func DoneTransferTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosUint(aria2.TransferTaskManager.ListDone()))
-}
-
-func CancelTransferTask(c *gin.Context) {
-	id := c.Query("tid")
-	tid, err := strconv.ParseUint(id, 10, 64)
-	if err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if err := aria2.TransferTaskManager.Cancel(tid); err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
+	}))
+	g.POST("/retry", getTargetedHandler(manager, func(c *gin.Context, task T) {
+		manager.Retry(task.GetID())
 		common.SuccessResp(c)
-	}
-}
-
-func DeleteTransferTask(c *gin.Context) {
-	id := c.Query("tid")
-	tid, err := strconv.ParseUint(id, 10, 64)
-	if err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if err := aria2.TransferTaskManager.Remove(tid); err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
+	}))
+	g.POST("/cancel_some", getBatchHandler(manager, func(task T) {
+		manager.Cancel(task.GetID())
+	}))
+	g.POST("/delete_some", getBatchHandler(manager, func(task T) {
+		manager.Remove(task.GetID())
+	}))
+	g.POST("/retry_some", getBatchHandler(manager, func(task T) {
+		manager.Retry(task.GetID())
+	}))
+	g.POST("/clear_done", func(c *gin.Context) {
+		isAdmin, uid, ok := getUserInfo(c)
+		if !ok {
+			// if there is no bug, here is unreachable
+			common.ErrorStrResp(c, "user invalid", 401)
+			return
+		}
+		manager.RemoveByCondition(func(task T) bool {
+			return (isAdmin || uid == task.GetCreator().ID) &&
+				argsContains(task.GetState(), tache.StateCanceled, tache.StateFailed, tache.StateSucceeded)
+		})
 		common.SuccessResp(c)
-	}
-}
-
-func ClearDoneTransferTasks(c *gin.Context) {
-	aria2.TransferTaskManager.ClearDone()
-	common.SuccessResp(c)
-}
-
-func UndoneUploadTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosUint(fs.UploadTaskManager.ListUndone()))
-}
-
-func DoneUploadTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosUint(fs.UploadTaskManager.ListDone()))
-}
-
-func CancelUploadTask(c *gin.Context) {
-	id := c.Query("tid")
-	tid, err := strconv.ParseUint(id, 10, 64)
-	if err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if err := fs.UploadTaskManager.Cancel(tid); err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
+	})
+	g.POST("/clear_succeeded", func(c *gin.Context) {
+		isAdmin, uid, ok := getUserInfo(c)
+		if !ok {
+			// if there is no bug, here is unreachable
+			common.ErrorStrResp(c, "user invalid", 401)
+			return
+		}
+		manager.RemoveByCondition(func(task T) bool {
+			return (isAdmin || uid == task.GetCreator().ID) && task.GetState() == tache.StateSucceeded
+		})
 		common.SuccessResp(c)
-	}
-}
-
-func DeleteUploadTask(c *gin.Context) {
-	id := c.Query("tid")
-	tid, err := strconv.ParseUint(id, 10, 64)
-	if err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if err := fs.UploadTaskManager.Remove(tid); err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
+	})
+	g.POST("/retry_failed", func(c *gin.Context) {
+		isAdmin, uid, ok := getUserInfo(c)
+		if !ok {
+			// if there is no bug, here is unreachable
+			common.ErrorStrResp(c, "user invalid", 401)
+			return
+		}
+		tasks := manager.GetByCondition(func(task T) bool {
+			return (isAdmin || uid == task.GetCreator().ID) && task.GetState() == tache.StateFailed
+		})
+		for _, t := range tasks {
+			manager.Retry(t.GetID())
+		}
 		common.SuccessResp(c)
-	}
+	})
 }
 
-func ClearDoneUploadTasks(c *gin.Context) {
-	fs.UploadTaskManager.ClearDone()
-	common.SuccessResp(c)
-}
-
-func UndoneCopyTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosUint(fs.CopyTaskManager.ListUndone()))
-}
-
-func DoneCopyTask(c *gin.Context) {
-	common.SuccessResp(c, getTaskInfosUint(fs.CopyTaskManager.ListDone()))
-}
-
-func CancelCopyTask(c *gin.Context) {
-	id := c.Query("tid")
-	tid, err := strconv.ParseUint(id, 10, 64)
-	if err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if err := fs.CopyTaskManager.Cancel(tid); err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
-		common.SuccessResp(c)
-	}
-}
-
-func DeleteCopyTask(c *gin.Context) {
-	id := c.Query("tid")
-	tid, err := strconv.ParseUint(id, 10, 64)
-	if err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if err := fs.CopyTaskManager.Remove(tid); err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
-		common.SuccessResp(c)
-	}
-}
-
-func ClearDoneCopyTasks(c *gin.Context) {
-	fs.CopyTaskManager.ClearDone()
-	common.SuccessResp(c)
+func SetupTaskRoute(g *gin.RouterGroup) {
+	taskRoute(g.Group("/upload"), fs.UploadTaskManager)
+	taskRoute(g.Group("/copy"), fs.CopyTaskManager)
+	taskRoute(g.Group("/offline_download"), tool.DownloadTaskManager)
+	taskRoute(g.Group("/offline_download_transfer"), tool.TransferTaskManager)
+	taskRoute(g.Group("/decompress"), fs.ArchiveDownloadTaskManager)
+	taskRoute(g.Group("/decompress_upload"), fs.ArchiveContentUploadTaskManager)
 }

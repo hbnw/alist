@@ -1,25 +1,30 @@
 package baidu_netdisk
 
 import (
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
+	"github.com/avast/retry-go"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 // do others that not defined in Driver interface
 
 func (d *BaiduNetdisk) refreshToken() error {
 	err := d._refreshToken()
-	if err != nil && err == errs.EmptyToken {
+	if err != nil && errors.Is(err, errs.EmptyToken) {
 		err = d._refreshToken()
 	}
 	return err
@@ -50,30 +55,40 @@ func (d *BaiduNetdisk) _refreshToken() error {
 }
 
 func (d *BaiduNetdisk) request(furl string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	req := base.RestyClient.R()
-	req.SetQueryParam("access_token", d.AccessToken)
-	if callback != nil {
-		callback(req)
-	}
-	if resp != nil {
-		req.SetResult(resp)
-	}
-	res, err := req.Execute(method, furl)
-	if err != nil {
-		return nil, err
-	}
-	errno := utils.Json.Get(res.Body(), "errno").ToInt()
-	if errno != 0 {
-		if errno == -6 {
-			err = d.refreshToken()
-			if err != nil {
-				return nil, err
-			}
-			return d.request(furl, method, callback, resp)
+	var result []byte
+	err := retry.Do(func() error {
+		req := base.RestyClient.R()
+		req.SetQueryParam("access_token", d.AccessToken)
+		if callback != nil {
+			callback(req)
 		}
-		return nil, fmt.Errorf("errno: %d, refer to https://pan.baidu.com/union/doc/", errno)
-	}
-	return res.Body(), nil
+		if resp != nil {
+			req.SetResult(resp)
+		}
+		res, err := req.Execute(method, furl)
+		if err != nil {
+			return err
+		}
+		log.Debugf("[baidu_netdisk] req: %s, resp: %s", furl, res.String())
+		errno := utils.Json.Get(res.Body(), "errno").ToInt()
+		if errno != 0 {
+			if utils.SliceContains([]int{111, -6}, errno) {
+				log.Info("refreshing baidu_netdisk token.")
+				err2 := d.refreshToken()
+				if err2 != nil {
+					return retry.Unrecoverable(err2)
+				}
+			}
+			return fmt.Errorf("req: [%s] ,errno: %d, refer to https://pan.baidu.com/union/doc/", furl, errno)
+		}
+		result = res.Body()
+		return nil
+	},
+		retry.LastErrorOnly(true),
+		retry.Attempts(3),
+		retry.Delay(time.Second),
+		retry.DelayType(retry.BackOffDelay))
+	return result, err
 }
 
 func (d *BaiduNetdisk) get(pathname string, params map[string]string, resp interface{}) ([]byte, error) {
@@ -82,10 +97,10 @@ func (d *BaiduNetdisk) get(pathname string, params map[string]string, resp inter
 	}, resp)
 }
 
-func (d *BaiduNetdisk) post(pathname string, params map[string]string, data interface{}, resp interface{}) ([]byte, error) {
+func (d *BaiduNetdisk) postForm(pathname string, params map[string]string, form map[string]string, resp interface{}) ([]byte, error) {
 	return d.request("https://pan.baidu.com/rest/2.0"+pathname, http.MethodPost, func(req *resty.Request) {
 		req.SetQueryParams(params)
-		req.SetBody(data)
+		req.SetFormData(form)
 	}, resp)
 }
 
@@ -140,6 +155,7 @@ func (d *BaiduNetdisk) linkOfficial(file model.Obj, args model.LinkArgs) (*model
 	//if res.StatusCode() == 302 {
 	u = res.Header().Get("location")
 	//}
+
 	return &model.Link{
 		URL: u,
 		Header: http.Header{
@@ -162,40 +178,115 @@ func (d *BaiduNetdisk) linkCrack(file model.Obj, args model.LinkArgs) (*model.Li
 	if err != nil {
 		return nil, err
 	}
+
 	return &model.Link{
 		URL: resp.Info[0].Dlink,
 		Header: http.Header{
-			"User-Agent": []string{"pan.baidu.com"},
+			"User-Agent": []string{d.CustomCrackUA},
 		},
 	}, nil
 }
 
-func (d *BaiduNetdisk) manage(opera string, filelist interface{}) ([]byte, error) {
+func (d *BaiduNetdisk) manage(opera string, filelist any) ([]byte, error) {
 	params := map[string]string{
 		"method": "filemanager",
 		"opera":  opera,
 	}
-	marshal, err := utils.Json.Marshal(filelist)
-	if err != nil {
-		return nil, err
-	}
-	data := fmt.Sprintf("async=0&filelist=%s&ondup=newcopy", string(marshal))
-	return d.post("/xpan/file", params, data, nil)
+	marshal, _ := utils.Json.MarshalToString(filelist)
+	return d.postForm("/xpan/file", params, map[string]string{
+		"async":    "0",
+		"filelist": marshal,
+		"ondup":    "fail",
+	}, nil)
 }
 
-func (d *BaiduNetdisk) create(path string, size int64, isdir int, uploadid, block_list string) ([]byte, error) {
+func (d *BaiduNetdisk) create(path string, size int64, isdir int, uploadid, block_list string, resp any, mtime, ctime int64) ([]byte, error) {
 	params := map[string]string{
 		"method": "create",
 	}
-	data := fmt.Sprintf("path=%s&size=%d&isdir=%d", encodeURIComponent(path), size, isdir)
-	if uploadid != "" {
-		data += fmt.Sprintf("&uploadid=%s&block_list=%s", uploadid, block_list)
+	form := map[string]string{
+		"path":  path,
+		"size":  strconv.FormatInt(size, 10),
+		"isdir": strconv.Itoa(isdir),
+		"rtype": "3",
 	}
-	return d.post("/xpan/file", params, data, nil)
+	if mtime != 0 && ctime != 0 {
+		joinTime(form, ctime, mtime)
+	}
+
+	if uploadid != "" {
+		form["uploadid"] = uploadid
+	}
+	if block_list != "" {
+		form["block_list"] = block_list
+	}
+	return d.postForm("/xpan/file", params, form, resp)
 }
 
-func encodeURIComponent(str string) string {
-	r := url.QueryEscape(str)
-	r = strings.ReplaceAll(r, "+", "%20")
-	return r
+func joinTime(form map[string]string, ctime, mtime int64) {
+	form["local_mtime"] = strconv.FormatInt(mtime, 10)
+	form["local_ctime"] = strconv.FormatInt(ctime, 10)
+}
+
+const (
+	DefaultSliceSize int64 = 4 * utils.MB
+	VipSliceSize           = 16 * utils.MB
+	SVipSliceSize          = 32 * utils.MB
+)
+
+func (d *BaiduNetdisk) getSliceSize() int64 {
+	if d.CustomUploadPartSize != 0 {
+		return d.CustomUploadPartSize
+	}
+	switch d.vipType {
+	case 1:
+		return VipSliceSize
+	case 2:
+		return SVipSliceSize
+	default:
+		return DefaultSliceSize
+	}
+}
+
+// func encodeURIComponent(str string) string {
+// 	r := url.QueryEscape(str)
+// 	r = strings.ReplaceAll(r, "+", "%20")
+// 	return r
+// }
+
+func DecryptMd5(encryptMd5 string) string {
+	if _, err := hex.DecodeString(encryptMd5); err == nil {
+		return encryptMd5
+	}
+
+	var out strings.Builder
+	out.Grow(len(encryptMd5))
+	for i, n := 0, int64(0); i < len(encryptMd5); i++ {
+		if i == 9 {
+			n = int64(unicode.ToLower(rune(encryptMd5[i])) - 'g')
+		} else {
+			n, _ = strconv.ParseInt(encryptMd5[i:i+1], 16, 64)
+		}
+		out.WriteString(strconv.FormatInt(n^int64(15&i), 16))
+	}
+
+	encryptMd5 = out.String()
+	return encryptMd5[8:16] + encryptMd5[:8] + encryptMd5[24:32] + encryptMd5[16:24]
+}
+
+func EncryptMd5(originalMd5 string) string {
+	reversed := originalMd5[8:16] + originalMd5[:8] + originalMd5[24:32] + originalMd5[16:24]
+
+	var out strings.Builder
+	out.Grow(len(reversed))
+	for i, n := 0, int64(0); i < len(reversed); i++ {
+		n, _ = strconv.ParseInt(reversed[i:i+1], 16, 64)
+		n ^= int64(15 & i)
+		if i == 9 {
+			out.WriteRune(rune(n) + 'g')
+		} else {
+			out.WriteString(strconv.FormatInt(n, 16))
+		}
+	}
+	return out.String()
 }

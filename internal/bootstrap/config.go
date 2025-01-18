@@ -1,13 +1,16 @@
 package bootstrap
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/alist-org/alist/v3/cmd/flags"
+	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/pkg/utils"
-	"github.com/caarlos0/env/v6"
+	"github.com/caarlos0/env/v9"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -31,6 +34,8 @@ func InitConfig() {
 			log.Fatalf("failed to create config file: %+v", err)
 		}
 		conf.Conf = conf.DefaultConfig()
+		LastLaunchedVersion = conf.Version
+		conf.Conf.LastLaunchedVersion = conf.Version
 		if !utils.WriteJsonToFile(configPath, conf.Conf) {
 			log.Fatalf("failed to create default config file")
 		}
@@ -44,12 +49,16 @@ func InitConfig() {
 		if err != nil {
 			log.Fatalf("load config error: %+v", err)
 		}
+		LastLaunchedVersion = conf.Conf.LastLaunchedVersion
+		if conf.Version != "dev" || LastLaunchedVersion == "" {
+			conf.Conf.LastLaunchedVersion = conf.Version
+		}
 		// update config.json struct
 		confBody, err := utils.Json.MarshalIndent(conf.Conf, "", "  ")
 		if err != nil {
 			log.Fatalf("marshal config error: %+v", err)
 		}
-		err = os.WriteFile(configPath, confBody, 0777)
+		err = os.WriteFile(configPath, confBody, 0o777)
 		if err != nil {
 			log.Fatalf("update config struct error: %+v", err)
 		}
@@ -65,15 +74,13 @@ func InitConfig() {
 		}
 		conf.Conf.TempDir = absPath
 	}
-	err := os.RemoveAll(filepath.Join(conf.Conf.TempDir))
-	if err != nil {
-		log.Errorln("failed delete temp file:", err)
-	}
-	err = os.MkdirAll(conf.Conf.TempDir, 0777)
+	err := os.MkdirAll(conf.Conf.TempDir, 0o777)
 	if err != nil {
 		log.Fatalf("create temp dir error: %+v", err)
 	}
 	log.Debugf("config: %+v", conf.Conf)
+	base.InitClient()
+	initURL()
 }
 
 func confFromEnv() {
@@ -82,9 +89,32 @@ func confFromEnv() {
 		prefix = ""
 	}
 	log.Infof("load config from env with prefix: %s", prefix)
-	if err := env.Parse(conf.Conf, env.Options{
+	if err := env.ParseWithOptions(conf.Conf, env.Options{
 		Prefix: prefix,
 	}); err != nil {
 		log.Fatalf("load config from env error: %+v", err)
+	}
+}
+
+func initURL() {
+	if !strings.Contains(conf.Conf.SiteURL, "://") {
+		conf.Conf.SiteURL = utils.FixAndCleanPath(conf.Conf.SiteURL)
+	}
+	u, err := url.Parse(conf.Conf.SiteURL)
+	if err != nil {
+		utils.Log.Fatalf("can't parse site_url: %+v", err)
+	}
+	conf.URL = u
+}
+
+func CleanTempDir() {
+	files, err := os.ReadDir(conf.Conf.TempDir)
+	if err != nil {
+		log.Errorln("failed list temp file: ", err)
+	}
+	for _, file := range files {
+		if err := os.RemoveAll(filepath.Join(conf.Conf.TempDir, file.Name())); err != nil {
+			log.Errorln("failed delete temp file: ", err)
+		}
 	}
 }

@@ -2,14 +2,15 @@ package baiduphoto
 
 import (
 	"context"
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
+	"unicode"
 
 	"github.com/alist-org/alist/v3/drivers/base"
-	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
 )
@@ -22,13 +23,10 @@ const (
 	FILE_API_URL_V2 = API_URL + "/file/v2"
 )
 
-var (
-	ErrNotSupportName = errors.New("only chinese and english, numbers and underscores are supported, and the length is no more than 20")
-)
-
-func (d *BaiduPhoto) Request(furl string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	req := base.RestyClient.R().
-		SetQueryParam("access_token", d.AccessToken)
+func (d *BaiduPhoto) Request(client *resty.Client, furl string, method string, callback base.ReqCallback, resp interface{}) (*resty.Response, error) {
+	req := client.R().
+		// SetQueryParam("access_token", d.AccessToken)
+		SetHeader("Cookie", d.Cookie)
 	if callback != nil {
 		callback(req)
 	}
@@ -48,46 +46,56 @@ func (d *BaiduPhoto) Request(furl string, method string, callback base.ReqCallba
 		return nil, fmt.Errorf("you have joined album")
 	case 50820:
 		return nil, fmt.Errorf("no shared albums found")
-	case -6:
-		if err = d.refreshToken(); err != nil {
-			return nil, err
-		}
+	case 50100:
+		return nil, fmt.Errorf("illegal title, only supports 50 characters")
+	// case -6:
+	// 	if err = d.refreshToken(); err != nil {
+	// 		return nil, err
+	// 	}
 	default:
 		return nil, fmt.Errorf("errno: %d, refer to https://photo.baidu.com/union/doc", erron)
 	}
-	return res.Body(), nil
+	return res, nil
 }
 
-func (d *BaiduPhoto) refreshToken() error {
-	u := "https://openapi.baidu.com/oauth/2.0/token"
-	var resp base.TokenResp
-	var e TokenErrResp
-	_, err := base.RestyClient.R().SetResult(&resp).SetError(&e).SetQueryParams(map[string]string{
-		"grant_type":    "refresh_token",
-		"refresh_token": d.RefreshToken,
-		"client_id":     d.ClientID,
-		"client_secret": d.ClientSecret,
-	}).Get(u)
-	if err != nil {
-		return err
-	}
-	if e.ErrorMsg != "" {
-		return &e
-	}
-	if resp.RefreshToken == "" {
-		return errs.EmptyToken
-	}
-	d.AccessToken, d.RefreshToken = resp.AccessToken, resp.RefreshToken
-	op.MustSaveDriverStorage(d)
-	return nil
+//func (d *BaiduPhoto) Request(furl string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+//	res, err := d.request(furl, method, callback, resp)
+//	if err != nil {
+//		return nil, err
+//	}
+//	return res.Body(), nil
+//}
+
+// func (d *BaiduPhoto) refreshToken() error {
+// 	u := "https://openapi.baidu.com/oauth/2.0/token"
+// 	var resp base.TokenResp
+// 	var e TokenErrResp
+// 	_, err := base.RestyClient.R().SetResult(&resp).SetError(&e).SetQueryParams(map[string]string{
+// 		"grant_type":    "refresh_token",
+// 		"refresh_token": d.RefreshToken,
+// 		"client_id":     d.ClientID,
+// 		"client_secret": d.ClientSecret,
+// 	}).Get(u)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	if e.ErrorMsg != "" {
+// 		return &e
+// 	}
+// 	if resp.RefreshToken == "" {
+// 		return errs.EmptyToken
+// 	}
+// 	d.AccessToken, d.RefreshToken = resp.AccessToken, resp.RefreshToken
+// 	op.MustSaveDriverStorage(d)
+// 	return nil
+// }
+
+func (d *BaiduPhoto) Get(furl string, callback base.ReqCallback, resp interface{}) (*resty.Response, error) {
+	return d.Request(base.RestyClient, furl, http.MethodGet, callback, resp)
 }
 
-func (d *BaiduPhoto) Get(furl string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	return d.Request(furl, http.MethodGet, callback, resp)
-}
-
-func (d *BaiduPhoto) Post(furl string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	return d.Request(furl, http.MethodPost, callback, resp)
+func (d *BaiduPhoto) Post(furl string, callback base.ReqCallback, resp interface{}) (*resty.Response, error) {
+	return d.Request(base.RestyClient, furl, http.MethodPost, callback, resp)
 }
 
 // 获取所有文件
@@ -188,9 +196,6 @@ func (d *BaiduPhoto) GetAllAlbumFile(ctx context.Context, album *Album, passwd s
 
 // 创建相册
 func (d *BaiduPhoto) CreateAlbum(ctx context.Context, name string) (*Album, error) {
-	if !checkName(name) {
-		return nil, ErrNotSupportName
-	}
 	var resp JoinOrCreateAlbumResp
 	_, err := d.Post(ALBUM_API_URL+"/create", func(r *resty.Request) {
 		r.SetContext(ctx).SetResult(&resp)
@@ -208,10 +213,6 @@ func (d *BaiduPhoto) CreateAlbum(ctx context.Context, name string) (*Album, erro
 
 // 相册改名
 func (d *BaiduPhoto) SetAlbumName(ctx context.Context, album *Album, name string) (*Album, error) {
-	if !checkName(name) {
-		return nil, ErrNotSupportName
-	}
-
 	_, err := d.Post(ALBUM_API_URL+"/settitle", func(r *resty.Request) {
 		r.SetContext(ctx)
 		r.SetFormData(map[string]string{
@@ -233,7 +234,7 @@ func (d *BaiduPhoto) DeleteAlbum(ctx context.Context, album *Album) error {
 		r.SetFormData(map[string]string{
 			"album_id":            album.AlbumID,
 			"tid":                 fmt.Sprint(album.Tid),
-			"delete_origin_image": "0", // 是否删除原图 0 不删除 1 删除
+			"delete_origin_image": BoolToIntStr(d.DeleteOrigin), // 是否删除原图 0 不删除 1 删除
 		})
 	}, nil)
 	return err
@@ -247,7 +248,7 @@ func (d *BaiduPhoto) DeleteAlbumFile(ctx context.Context, file *AlbumFile) error
 			"album_id":   fmt.Sprint(file.AlbumID),
 			"tid":        fmt.Sprint(file.Tid),
 			"list":       fmt.Sprintf(`[{"fsid":%d,"uk":%d}]`, file.Fsid, file.Uk),
-			"del_origin": "0", // 是否删除原图 0 不删除 1 删除
+			"del_origin": BoolToIntStr(d.DeleteOrigin), // 是否删除原图 0 不删除 1 删除
 		})
 	}, nil)
 	return err
@@ -340,24 +341,29 @@ func (d *BaiduPhoto) linkAlbum(ctx context.Context, file *AlbumFile, args model.
 		headers["X-Forwarded-For"] = args.IP
 	}
 
-	res, err := base.NoRedirectClient.R().
-		SetContext(ctx).
-		SetHeaders(headers).
-		SetQueryParams(map[string]string{
-			"access_token": d.AccessToken,
-			"fsid":         fmt.Sprint(file.Fsid),
-			"album_id":     file.AlbumID,
-			"tid":          fmt.Sprint(file.Tid),
-			"uk":           fmt.Sprint(file.Uk),
-		}).
-		Head(ALBUM_API_URL + "/download")
+	resp, err := d.Request(base.NoRedirectClient, ALBUM_API_URL+"/download", http.MethodHead, func(r *resty.Request) {
+		r.SetContext(ctx)
+		r.SetHeaders(headers)
+		r.SetQueryParams(map[string]string{
+			"fsid":     fmt.Sprint(file.Fsid),
+			"album_id": file.AlbumID,
+			"tid":      fmt.Sprint(file.Tid),
+			"uk":       fmt.Sprint(file.Uk),
+		})
+	}, nil)
 
 	if err != nil {
 		return nil, err
 	}
 
+	if resp.StatusCode() != 302 {
+		return nil, fmt.Errorf("not found 302 redirect")
+	}
+
+	location := resp.Header().Get("Location")
+
 	link := &model.Link{
-		URL: res.Header().Get("location"),
+		URL: location,
 		Header: http.Header{
 			"User-Agent": []string{headers["User-Agent"]},
 			"Referer":    []string{"https://photo.baidu.com/"},
@@ -387,10 +393,24 @@ func (d *BaiduPhoto) linkFile(ctx context.Context, file *File, args model.LinkAr
 			"fsid": fmt.Sprint(file.Fsid),
 		})
 	}, &downloadUrl)
+
+	// resp, err := d.Request(base.NoRedirectClient, FILE_API_URL_V1+"/download", http.MethodHead, func(r *resty.Request) {
+	// 	r.SetContext(ctx)
+	// 	r.SetHeaders(headers)
+	// 	r.SetQueryParams(map[string]string{
+	// 		"fsid": fmt.Sprint(file.Fsid),
+	// 	})
+	// }, nil)
+
 	if err != nil {
 		return nil, err
 	}
 
+	// if resp.StatusCode() != 302 {
+	// 	return nil, fmt.Errorf("not found 302 redirect")
+	// }
+
+	// location := resp.Header().Get("Location")
 	link := &model.Link{
 		URL: downloadUrl.Dlink,
 		Header: http.Header{
@@ -400,6 +420,49 @@ func (d *BaiduPhoto) linkFile(ctx context.Context, file *File, args model.LinkAr
 	}
 	return link, nil
 }
+
+/*func (d *BaiduPhoto) linkStreamAlbum(ctx context.Context, file *AlbumFile) (*model.Link, error) {
+	return &model.Link{
+		Header: http.Header{},
+		Writer: func(w io.Writer) error {
+			res, err := d.Get(ALBUM_API_URL+"/streaming", func(r *resty.Request) {
+				r.SetContext(ctx)
+				r.SetQueryParams(map[string]string{
+					"fsid":     fmt.Sprint(file.Fsid),
+					"album_id": file.AlbumID,
+					"tid":      fmt.Sprint(file.Tid),
+					"uk":       fmt.Sprint(file.Uk),
+				}).SetDoNotParseResponse(true)
+			}, nil)
+			if err != nil {
+				return err
+			}
+			defer res.RawBody().Close()
+			_, err = io.Copy(w, res.RawBody())
+			return err
+		},
+	}, nil
+}*/
+
+/*func (d *BaiduPhoto) linkStream(ctx context.Context, file *File) (*model.Link, error) {
+	return &model.Link{
+		Header: http.Header{},
+		Writer: func(w io.Writer) error {
+			res, err := d.Get(FILE_API_URL_V1+"/streaming", func(r *resty.Request) {
+				r.SetContext(ctx)
+				r.SetQueryParams(map[string]string{
+					"fsid": fmt.Sprint(file.Fsid),
+				}).SetDoNotParseResponse(true)
+			}, nil)
+			if err != nil {
+				return err
+			}
+			defer res.RawBody().Close()
+			_, err = io.Copy(w, res.RawBody())
+			return err
+		},
+	}, nil
+}*/
 
 // 获取uk
 func (d *BaiduPhoto) uInfo() (*UInfo, error) {
@@ -411,4 +474,56 @@ func (d *BaiduPhoto) uInfo() (*UInfo, error) {
 		return nil, err
 	}
 	return &info, nil
+}
+
+func (d *BaiduPhoto) getBDStoken() (string, error) {
+	var info struct {
+		Result struct {
+			Bdstoken string `json:"bdstoken"`
+			Token    string `json:"token"`
+			Uk       int64  `json:"uk"`
+		} `json:"result"`
+	}
+	_, err := d.Get("https://pan.baidu.com/api/gettemplatevariable?fields=[%22bdstoken%22,%22token%22,%22uk%22]", nil, &info)
+	if err != nil {
+		return "", err
+	}
+	return info.Result.Bdstoken, nil
+}
+
+func DecryptMd5(encryptMd5 string) string {
+	if _, err := hex.DecodeString(encryptMd5); err == nil {
+		return encryptMd5
+	}
+
+	var out strings.Builder
+	out.Grow(len(encryptMd5))
+	for i, n := 0, int64(0); i < len(encryptMd5); i++ {
+		if i == 9 {
+			n = int64(unicode.ToLower(rune(encryptMd5[i])) - 'g')
+		} else {
+			n, _ = strconv.ParseInt(encryptMd5[i:i+1], 16, 64)
+		}
+		out.WriteString(strconv.FormatInt(n^int64(15&i), 16))
+	}
+
+	encryptMd5 = out.String()
+	return encryptMd5[8:16] + encryptMd5[:8] + encryptMd5[24:32] + encryptMd5[16:24]
+}
+
+func EncryptMd5(originalMd5 string) string {
+	reversed := originalMd5[8:16] + originalMd5[:8] + originalMd5[24:32] + originalMd5[16:24]
+
+	var out strings.Builder
+	out.Grow(len(reversed))
+	for i, n := 0, int64(0); i < len(reversed); i++ {
+		n, _ = strconv.ParseInt(reversed[i:i+1], 16, 64)
+		n ^= int64(15 & i)
+		if i == 9 {
+			out.WriteRune(rune(n) + 'g')
+		} else {
+			out.WriteString(strconv.FormatInt(n, 16))
+		}
+	}
+	return out.String()
 }

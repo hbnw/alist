@@ -78,10 +78,19 @@ func writeFile(name string, data interface{}) {
 func generateDriversJson() {
 	drivers := make(Drivers)
 	drivers["drivers"] = make(KV[interface{}])
+	drivers["config"] = make(KV[interface{}])
 	driverInfoMap := op.GetDriverInfoMap()
 	for k, v := range driverInfoMap {
 		drivers["drivers"][k] = convert(k)
 		items := make(KV[interface{}])
+		config := map[string]string{}
+		if v.Config.Alert != "" {
+			alert := strings.SplitN(v.Config.Alert, "|", 2)
+			if len(alert) > 1 {
+				config["alert"] = alert[1]
+			}
+		}
+		drivers["config"][k] = config
 		for i := range v.Additional {
 			item := v.Additional[i]
 			items[item.Name] = convert(item.Name)
@@ -130,7 +139,7 @@ var LangCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		err := os.MkdirAll("lang", 0777)
 		if err != nil {
-			utils.Log.Fatal("failed create folder: %s", err.Error())
+			utils.Log.Fatalf("failed create folder: %s", err.Error())
 		}
 		generateDriversJson()
 		generateSettingsJson()

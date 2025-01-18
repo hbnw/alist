@@ -2,10 +2,13 @@ package model
 
 import (
 	"io"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/alist-org/alist/v3/pkg/http_range"
+	"github.com/alist-org/alist/v3/pkg/utils"
+	"github.com/dlclark/regexp2"
 
 	mapset "github.com/deckarep/golang-set/v2"
 
@@ -20,7 +23,9 @@ type Obj interface {
 	GetSize() int64
 	GetName() string
 	ModTime() time.Time
+	CreateTime() time.Time
 	IsDir() bool
+	GetHash() utils.HashInfo
 
 	// The internal information of the driver.
 	// If you want to use it, please understand what it means
@@ -28,15 +33,25 @@ type Obj interface {
 	GetPath() string
 }
 
+// FileStreamer ->check FileStream for more comments
 type FileStreamer interface {
-	io.ReadCloser
+	io.Reader
+	io.Closer
 	Obj
 	GetMimetype() string
-	SetReadCloser(io.ReadCloser)
+	//SetReader(io.Reader)
 	NeedStore() bool
-	GetReadCloser() io.ReadCloser
-	GetOld() Obj
+	IsForceStreamUpload() bool
+	GetExist() Obj
+	SetExist(Obj)
+	//for a non-seekable Stream, RangeRead supports peeking some data, and CacheFullInTempFile still works
+	RangeRead(http_range.Range) (io.Reader, error)
+	//for a non-seekable Stream, if Read is called, this function won't work
+	CacheFullInTempFile() (File, error)
+	CacheFullInTempFileAndUpdateProgress(up UpdateProgress) (File, error)
 }
+
+type UpdateProgress func(percentage float64)
 
 type URL interface {
 	URL() string
@@ -136,6 +151,20 @@ func GetUrl(obj Obj) (url string, ok bool) {
 	return url, false
 }
 
+func GetRawObject(obj Obj) *Object {
+	switch v := obj.(type) {
+	case *ObjThumbURL:
+		return &v.Object
+	case *ObjThumb:
+		return &v.Object
+	case *ObjectURL:
+		return &v.Object
+	case *Object:
+		return v
+	}
+	return nil
+}
+
 // Merge
 func NewObjMerge() *ObjMerge {
 	return &ObjMerge{
@@ -144,7 +173,7 @@ func NewObjMerge() *ObjMerge {
 }
 
 type ObjMerge struct {
-	regs []*regexp.Regexp
+	regs []*regexp2.Regexp
 	set  mapset.Set[string]
 }
 
@@ -165,7 +194,7 @@ func (om *ObjMerge) insertObjs(objs []Obj, objs_ ...Obj) []Obj {
 
 func (om *ObjMerge) clickObj(obj Obj) bool {
 	for _, reg := range om.regs {
-		if reg.MatchString(obj.GetName()) {
+		if isMatch, _ := reg.MatchString(obj.GetName()); isMatch {
 			return false
 		}
 	}
@@ -174,9 +203,9 @@ func (om *ObjMerge) clickObj(obj Obj) bool {
 
 func (om *ObjMerge) InitHideReg(hides string) {
 	rs := strings.Split(hides, "\n")
-	om.regs = make([]*regexp.Regexp, 0, len(rs))
+	om.regs = make([]*regexp2.Regexp, 0, len(rs))
 	for _, r := range rs {
-		om.regs = append(om.regs, regexp.MustCompile(r))
+		om.regs = append(om.regs, regexp2.MustCompile(r, regexp2.None))
 	}
 }
 

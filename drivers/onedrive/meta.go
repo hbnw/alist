@@ -11,10 +11,11 @@ type Addition struct {
 	IsSharepoint bool   `json:"is_sharepoint"`
 	ClientID     string `json:"client_id" required:"true"`
 	ClientSecret string `json:"client_secret" required:"true"`
-	RedirectUri  string `json:"redirect_uri" required:"true" default:"https://tool.nn.ci/onedrive/callback"`
+	RedirectUri  string `json:"redirect_uri" required:"true" default:"https://alist.nn.ci/tool/onedrive/callback"`
 	RefreshToken string `json:"refresh_token" required:"true"`
 	SiteId       string `json:"site_id"`
 	ChunkSize    int64  `json:"chunk_size" type:"number" default:"5"`
+	CustomHost   string `json:"custom_host" help:"Custom host for onedrive download link"`
 }
 
 var config = driver.Config{
